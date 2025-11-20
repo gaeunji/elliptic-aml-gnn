@@ -4,12 +4,13 @@ os.environ['MKL_THREADING_LAYER'] = 'GNU'
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import argparse
 import random
 import numpy as np
 from pathlib import Path
-from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 from torch_geometric.data import HeteroData
 
 # Conditionally import NeighborLoader (requires pyg-lib or torch-sparse)
@@ -49,7 +50,7 @@ def get_args():
     
     # Model
     parser.add_argument("--model", type=str, default="sage", 
-                       choices=["sage", "gat", "gcn"],
+                       choices=["sage", "gat", "gcn", "gtnlite"],
                        help="Model architecture")
     parser.add_argument("--hidden_channels", type=int, default=64,
                        help="Hidden layer dimension")
@@ -70,7 +71,7 @@ def get_args():
                        help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=5e-4,
                        help="Weight decay")
-    parser.add_argument("--epochs", type=int, default=200,
+    parser.add_argument("--epochs", type=int, default=20,
                        help="Number of training epochs")
     parser.add_argument("--log_interval", type=int, default=10,
                        help="Log every N epochs")
@@ -136,10 +137,10 @@ def load_data(data_path, use_neighbor_sampling=False):
         hetero_data["addr", "to", "tx"].edge_index = data["addr", "to", "tx"].edge_index
         hetero_data["tx", "to", "addr"].edge_index = data["tx", "to", "addr"].edge_index
         
-        # Map labels 1/2 → 0/1 (for evaluation)
+        # Map labels: 1(illicit/불법) → 1, 2(licit/정상) → 0
         y_tx_raw = data["tx"].y.clone()
         y_tx = y_tx_raw.clone()
-        label_map = {1: 0, 2: 1}
+        label_map = {1: 1, 2: 0}  # illicit → 1, licit → 0
         for old, new in label_map.items():
             y_tx[y_tx_raw == old] = new
         
@@ -168,9 +169,9 @@ def load_data(data_path, use_neighbor_sampling=False):
         val_mask = data["tx"].val_mask
         test_mask = data["tx"].test_mask
         
-        # Map labels 1/2 → 0/1
+        # Map labels: 1(illicit/불법) → 1, 2(licit/정상) → 0
         y_tx = y_tx_raw.clone()
-        label_map = {1: 0, 2: 1}
+        label_map = {1: 1, 2: 0}  # illicit → 1, licit → 0
         for old, new in label_map.items():
             y_tx[y_tx_raw == old] = new
         
@@ -178,9 +179,46 @@ def load_data(data_path, use_neighbor_sampling=False):
 
 
 # ============================================================
+# Class Weight Calculation
+# ============================================================
+def compute_class_weights(y_tx, train_mask, device):
+    """
+    Compute class weights for imbalanced dataset (binary classification).
+    y_tx: tensor with {0=licit, 1=illicit, -1=unknown}
+    """
+    # Filter labeled train samples
+    train_labels = y_tx[train_mask & (y_tx != -1)]
+
+    # Safety check
+    if train_labels.numel() == 0:
+        return None
+    
+    # Count labels
+    num_pos = (train_labels == 1).sum().item()
+    num_neg = (train_labels == 0).sum().item()
+
+    # Avoid divide-by-zero
+    if num_pos == 0 or num_neg == 0:
+        return None
+
+    # Inverse frequency
+    total = num_pos + num_neg
+    w_neg = total / num_neg
+    w_pos = total / num_pos
+
+    class_weights = torch.tensor([w_neg, w_pos], dtype=torch.float32, device=device)
+
+    # (Optional) clipping to prevent explosion
+    class_weights = torch.clamp(class_weights, max=10.0)
+
+    return class_weights
+
+
+
+# ============================================================
 # Training & Evaluation
 # ============================================================
-def train_epoch_full_graph(model, x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask, optimizer):
+def train_epoch_full_graph(model, x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask, optimizer, class_weights=None):
     """Train for one epoch using full graph"""
     model.train()
     optimizer.zero_grad()
@@ -190,7 +228,14 @@ def train_epoch_full_graph(model, x_dict, edge_index_dict, y_tx, y_tx_raw, train
     
     # Only labeled nodes (exclude unknown=-1)
     mask = train_mask & (y_tx_raw != -1)
-    loss = F.cross_entropy(logits_tx[mask], y_tx[mask])
+    
+    if class_weights is not None:
+        # Ensure class_weights is on the same device as logits
+        if class_weights.device != logits_tx.device:
+            class_weights = class_weights.to(logits_tx.device)
+        loss = F.cross_entropy(logits_tx[mask], y_tx[mask], weight=class_weights)
+    else:
+        loss = F.cross_entropy(logits_tx[mask], y_tx[mask])
     
     loss.backward()
     optimizer.step()
@@ -198,7 +243,7 @@ def train_epoch_full_graph(model, x_dict, edge_index_dict, y_tx, y_tx_raw, train
     return float(loss.item())
 
 
-def train_epoch_neighbor_sampling(model, train_loader, device, optimizer):
+def train_epoch_neighbor_sampling(model, train_loader, device, optimizer, class_weights=None):
     """Train for one epoch using neighbor sampling"""
     model.train()
     total_loss = 0.0
@@ -227,13 +272,19 @@ def train_epoch_neighbor_sampling(model, train_loader, device, optimizer):
         mask = train_mask_batch & (y_batch != -1)
         
         if mask.sum() > 0:
-            # Map labels 1/2 → 0/1
+            # Map labels: 1(illicit/불법) → 1, 2(licit/정상) → 0
             y_batch_mapped = y_batch.clone()
-            label_map = {1: 0, 2: 1}
+            label_map = {1: 1, 2: 0}  # illicit → 1, licit → 0
             for old, new in label_map.items():
                 y_batch_mapped[y_batch == old] = new
             
-            loss = F.cross_entropy(logits_tx[mask], y_batch_mapped[mask])
+            if class_weights is not None:
+                # Ensure class_weights is on the same device as logits
+                if class_weights.device != logits_tx.device:
+                    class_weights = class_weights.to(logits_tx.device)
+                loss = F.cross_entropy(logits_tx[mask], y_batch_mapped[mask], weight=class_weights)
+            else:
+                loss = F.cross_entropy(logits_tx[mask], y_batch_mapped[mask])
             loss.backward()
             optimizer.step()
             
@@ -255,22 +306,51 @@ def evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, mask):
     pred = logits_tx[eval_mask].argmax(dim=-1)
     y_true = y_tx[eval_mask]
     
+    # Calculate loss
+    loss = F.cross_entropy(logits_tx[eval_mask], y_true).item()
+    
     correct = (pred == y_true).sum().item()
     total = int(eval_mask.sum())
     
     acc = correct / total if total > 0 else 0.0
     
-    # Calculate precision, recall, f1
+    # Calculate precision, recall, f1, confusion matrix
     if total > 0:
         pred_np = pred.cpu().numpy()
         y_true_np = y_true.cpu().numpy()
         precision = precision_score(y_true_np, pred_np, average='binary', zero_division=0)
         recall = recall_score(y_true_np, pred_np, average='binary', zero_division=0)
         f1 = f1_score(y_true_np, pred_np, average='binary', zero_division=0)
+        cm = confusion_matrix(y_true_np, pred_np, labels=[0, 1])
     else:
         precision = recall = f1 = 0.0
+        cm = np.array([[0, 0], [0, 0]])
     
-    return acc, precision, recall, f1
+    return acc, precision, recall, f1, loss, cm
+
+
+def print_relation_weights(model, edge_index_dict=None):
+    """
+    GTNLite 모델의 relation weight를 출력
+    """
+    if not hasattr(model, 'layers') or not hasattr(model, 'edge_types'):
+        return
+    
+    print("\n" + "=" * 60)
+    print("Learned Relation Weights (GTNLite)")
+    print("=" * 60)
+    
+    edge_types = model.edge_types
+    
+    for layer_idx, layer in enumerate(model.layers):
+        if hasattr(layer, 'rel_logits'):
+            rel_weights = F.softmax(layer.rel_logits, dim=0)
+            print(f"\nLayer {layer_idx + 1}:")
+            for idx, (src, rel, dst) in enumerate(edge_types):
+                if idx < len(rel_weights):
+                    weight = rel_weights[idx].item()
+                    print(f"  {src:4s} -> {dst:4s} ({rel:2s}): {weight:7.4f} ({weight*100:5.2f}%)")
+    print("=" * 60 + "\n")
 
 
 @torch.no_grad()
@@ -295,22 +375,27 @@ def evaluate_from_hetero_data(model, hetero_data, y_tx, y_tx_raw, mask_name, dev
     pred = logits_tx[eval_mask].argmax(dim=-1)
     y_true = y_tx[eval_mask]
     
+    # Calculate loss
+    loss = F.cross_entropy(logits_tx[eval_mask], y_true).item()
+    
     correct = (pred == y_true).sum().item()
     total = int(eval_mask.sum())
     
     acc = correct / total if total > 0 else 0.0
     
-    # Calculate precision, recall, f1
+    # Calculate precision, recall, f1, confusion matrix
     if total > 0:
         pred_np = pred.numpy()
         y_true_np = y_true.numpy()
         precision = precision_score(y_true_np, pred_np, average='binary', zero_division=0)
         recall = recall_score(y_true_np, pred_np, average='binary', zero_division=0)
         f1 = f1_score(y_true_np, pred_np, average='binary', zero_division=0)
+        cm = confusion_matrix(y_true_np, pred_np, labels=[0, 1])
     else:
         precision = recall = f1 = 0.0
+        cm = np.array([[0, 0], [0, 0]])
     
-    return acc, precision, recall, f1
+    return acc, precision, recall, f1, loss, cm
 
 
 # ============================================================
@@ -482,7 +567,7 @@ def main():
             **model_kwargs
         ).to(device)
     else:
-        # SAGE and GCN use in_channels and aggr
+        # SAGE, GCN, and GTNLite use in_channels and aggr (GTNLite ignores aggr)
         model_kwargs = {
             "num_layers": args.num_layers,
             "dropout": args.dropout,
@@ -497,6 +582,46 @@ def main():
         ).to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}\n")
+    
+    # Compute class weights for imbalanced dataset
+    print("=" * 60)
+    print("Computing class weights for imbalanced dataset")
+    print("=" * 60)
+    
+    # Initialize class_weights to None (will be set if computation succeeds)
+    class_weights = None
+    
+    if args.use_neighbor_sampling:
+        train_labeled_mask = train_mask_eval & (y_tx_raw != -1)
+        train_labels = y_tx[train_labeled_mask]
+        train_mask_for_weights = train_mask_eval
+    else:
+        train_labeled_mask = train_mask & (y_tx_raw != -1)
+        train_labels = y_tx[train_labeled_mask]
+        train_mask_for_weights = train_mask
+    
+    if len(train_labels) > 0:
+        num_pos = (train_labels == 1).sum().item()
+        num_neg = (train_labels == 0).sum().item()
+        total = num_pos + num_neg
+        
+        print(f"Training set class distribution:")
+        print(f"  Class 0 (Licit/정상):   {num_neg:,} samples ({num_neg/total*100:.2f}%)")
+        print(f"  Class 1 (Illicit/불법): {num_pos:,} samples ({num_pos/total*100:.2f}%)")
+        
+        class_weights = compute_class_weights(y_tx, train_mask_for_weights, device)
+        if class_weights is not None:
+            print(f"\nComputed class weights (will be applied to loss):")
+            print(f"  Class 0 (Licit):  {class_weights[0].item():.4f}")
+            print(f"  Class 1 (Illicit): {class_weights[1].item():.4f}")
+            print(f"  Weight ratio (Class1/Class0): {class_weights[1].item()/class_weights[0].item():.4f}")
+            print(f"  Device: {class_weights.device}")
+        else:
+            print("\nWarning: Could not compute class weights. Using uniform weights.")
+    else:
+        print("Warning: No labeled training samples found. Using uniform weights.")
+    
+    print()
     
     # Optimizer
     optimizer = torch.optim.Adam(
@@ -520,24 +645,24 @@ def main():
     for epoch in range(1, args.epochs + 1):
         # Training
         if args.use_neighbor_sampling:
-            loss = train_epoch_neighbor_sampling(model, train_loader, device, optimizer)
+            train_loss = train_epoch_neighbor_sampling(model, train_loader, device, optimizer, class_weights)
             # Evaluation uses full graph
-            train_acc, train_prec, train_rec, train_f1 = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, train_mask_eval)
-            val_acc, val_prec, val_rec, val_f1 = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, val_mask_eval)
-            test_acc, test_prec, test_rec, test_f1 = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, test_mask_eval)
+            train_acc, train_prec, train_rec, train_f1, _, train_cm = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, train_mask_eval)
+            val_acc, val_prec, val_rec, val_f1, val_loss, val_cm = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, val_mask_eval)
+            test_acc, test_prec, test_rec, test_f1, _, test_cm = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, test_mask_eval)
         else:
-            loss = train_epoch_full_graph(model, x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask, optimizer)
-            train_acc, train_prec, train_rec, train_f1 = evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask)
-            val_acc, val_prec, val_rec, val_f1 = evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, val_mask)
-            test_acc, test_prec, test_rec, test_f1 = evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, test_mask)
+            train_loss = train_epoch_full_graph(model, x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask, optimizer, class_weights)
+            train_acc, train_prec, train_rec, train_f1, _, train_cm = evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask)
+            val_acc, val_prec, val_rec, val_f1, val_loss, val_cm = evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, val_mask)
+            test_acc, test_prec, test_rec, test_f1, _, test_cm = evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, test_mask)
         
         # Update best
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_test_acc = test_acc
             best_epoch = epoch
-            best_val_metrics = (val_acc, val_prec, val_rec, val_f1)
-            best_test_metrics = (test_acc, test_prec, test_rec, test_f1)
+            best_val_metrics = (val_acc, val_prec, val_rec, val_f1, val_cm)
+            best_test_metrics = (test_acc, test_prec, test_rec, test_f1, test_cm)
             
             # Save model
             if args.save_model:
@@ -556,21 +681,21 @@ def main():
                     'args': vars(args),
                 }, args.model_save_path)
         
-        # Log
-        if epoch % args.log_interval == 0 or epoch == 1:
+        # Log - 모든 epoch에 대해 출력
+        print(
+            f"Epoch {epoch:03d}/{args.epochs} | "
+            f"Train Loss: {train_loss:.4f} | "
+            f"Val Loss: {val_loss:.4f} | "
+            f"Train: Prec={train_prec:.4f} Rec={train_rec:.4f} F1={train_f1:.4f} | "
+            f"Val: Prec={val_prec:.4f} Rec={val_rec:.4f} F1={val_f1:.4f} | "
+            f"Test: Prec={test_prec:.4f} Rec={test_rec:.4f} F1={test_f1:.4f}"
+        )
+        if best_val_metrics:
             print(
-                f"Epoch {epoch:03d} | "
-                f"Loss: {loss:.4f} | "
-                f"Train: Prec={train_prec:.4f} Rec={train_rec:.4f} F1={train_f1:.4f} | "
-                f"Val: Prec={val_prec:.4f} Rec={val_rec:.4f} F1={val_f1:.4f} | "
-                f"Test: Prec={test_prec:.4f} Rec={test_rec:.4f} F1={test_f1:.4f}"
+                f"  Best @E{best_epoch}: "
+                f"Val(Prec={best_val_metrics[1]:.4f} Rec={best_val_metrics[2]:.4f} F1={best_val_metrics[3]:.4f}) | "
+                f"Test(Prec={best_test_metrics[1]:.4f} Rec={best_test_metrics[2]:.4f} F1={best_test_metrics[3]:.4f})"
             )
-            if best_val_metrics:
-                print(
-                    f"  Best @E{best_epoch}: "
-                    f"Val(Prec={best_val_metrics[1]:.4f} Rec={best_val_metrics[2]:.4f} F1={best_val_metrics[3]:.4f}) | "
-                    f"Test(Prec={best_test_metrics[1]:.4f} Rec={best_test_metrics[2]:.4f} F1={best_test_metrics[3]:.4f})"
-                )
     
     # Final results
     print("\n" + "=" * 60)
@@ -582,12 +707,28 @@ def main():
         print(f"  Precision: {best_val_metrics[1]:.4f}")
         print(f"  Recall:    {best_val_metrics[2]:.4f}")
         print(f"  F1-Score:  {best_val_metrics[3]:.4f}")
+        print(f"\nValidation Confusion Matrix:")
+        val_cm = best_val_metrics[4]
+        print(f"                Predicted")
+        print(f"              Class 0  Class 1")
+        print(f"  Actual 0    {val_cm[0,0]:6d}  {val_cm[0,1]:6d}")
+        print(f"  Actual 1    {val_cm[1,0]:6d}  {val_cm[1,1]:6d}")
         print(f"\nCorresponding Test Metrics:")
         print(f"  Precision: {best_test_metrics[1]:.4f}")
         print(f"  Recall:    {best_test_metrics[2]:.4f}")
         print(f"  F1-Score:  {best_test_metrics[3]:.4f}")
+        print(f"\nTest Confusion Matrix:")
+        test_cm = best_test_metrics[4]
+        print(f"                Predicted")
+        print(f"              Class 0  Class 1")
+        print(f"  Actual 0    {test_cm[0,0]:6d}  {test_cm[0,1]:6d}")
+        print(f"  Actual 1    {test_cm[1,0]:6d}  {test_cm[1,1]:6d}")
     else:
         print(f"Best epoch: {best_epoch}")
+    
+    # Print relation weights for GTNLite model
+    if args.model == "gtnlite":
+        print_relation_weights(model)
     
     if args.save_model:
         print(f"\nModel saved to: {args.model_save_path}")
