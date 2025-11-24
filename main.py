@@ -10,8 +10,9 @@ import argparse
 import random
 import numpy as np
 from pathlib import Path
-from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
-from torch_geometric.data import HeteroData
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score
+import numpy as np
+from torch_geometric.data import HeteroData, Data
 
 # Conditionally import NeighborLoader (requires pyg-lib or torch-sparse)
 try:
@@ -50,7 +51,7 @@ def get_args():
     
     # Model
     parser.add_argument("--model", type=str, default="sage", 
-                       choices=["sage", "gat", "gcn", "gtnlite"],
+                       choices=["sage", "gat", "gcn", "metapath", "homogat", "care", "hgt"],
                        help="Model architecture")
     parser.add_argument("--hidden_channels", type=int, default=64,
                        help="Hidden layer dimension")
@@ -62,9 +63,53 @@ def get_args():
                        choices=["sum", "mean", "max"],
                        help="Aggregation method")
     
+    # SAGE specific
+    parser.add_argument("--sage_no_neighbors", action="store_true",
+                       help="Use self-loops only for SAGE (ignore graph structure)")
+    
     # GAT specific
     parser.add_argument("--heads", type=int, default=4,
                        help="Number of attention heads (for GAT)")
+    
+    # MetaPathTxClassifier specific
+    parser.add_argument("--emb_dim", type=int, default=64,
+                       help="Embedding dimension for metapath model")
+    parser.add_argument("--num_layers_tat", type=int, default=2,
+                       help="Number of layers for TAT encoder (metapath model)")
+    parser.add_argument("--num_layers_ata", type=int, default=2,
+                       help="Number of layers for ATA encoder (metapath model)")
+    parser.add_argument("--semantic_hidden_dim", type=int, default=32,
+                       help="Hidden dimension for semantic attention (metapath model)")
+    
+    # CARE-GNN specific
+    parser.add_argument("--lambda_1", type=float, default=1.0,
+                       help="Weight for label loss in CARE-GNN")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                       help="Temperature parameter for label-aware similarity in CARE-GNN")
+    parser.add_argument("--care_batch_size", type=int, default=512,
+                       help="Batch size for CARE-GNN mini-batch training")
+    parser.add_argument("--care_use_batch", action="store_true", default=True,
+                       help="Use mini-batch training for CARE-GNN (default: True)")
+    parser.add_argument("--care_no_batch", dest="care_use_batch", action="store_false",
+                       help="Disable mini-batch training for CARE-GNN (use full graph)")
+    
+    # HGT specific
+    parser.add_argument("--conv_name", type=str, default="hgt",
+                       choices=["hgt", "hgt_care", "dense_hgt"],
+                       help="HGT convolution type")
+    parser.add_argument("--prev_norm", action="store_true",
+                       help="Use normalization in previous layers (HGT)")
+    parser.add_argument("--last_norm", action="store_true",
+                       help="Use normalization in last layer (HGT)")
+    parser.add_argument("--use_RTE", action="store_true", default=True,
+                       help="Use Relative Temporal Encoding (HGT)")
+    parser.add_argument("--no_RTE", dest="use_RTE", action="store_false",
+                       help="Disable Relative Temporal Encoding (HGT)")
+    parser.add_argument("--care_temperature", type=float, default=1.0,
+                       help="Temperature for CARE scoring in HGT-CARE")
+    parser.add_argument("--fusion_mode", type=str, default="log_add",
+                       choices=["log_add", "prob_mul"],
+                       help="Fusion mode for HGT-CARE")
     
     # Training
     parser.add_argument("--lr", type=float, default=0.01,
@@ -89,7 +134,7 @@ def get_args():
                        help="Device to use (auto/cuda/cpu)")
     
     # Seed
-    parser.add_argument("--seed", type=int, default=42,
+    parser.add_argument("--seed", type=int, default=88,
                        help="Random seed for reproducibility")
     
     # Save
@@ -105,11 +150,12 @@ def get_args():
 # Data Loading
 # ============================================================
 def load_data(data_path, use_neighbor_sampling=False):
-    """Load preprocessed heterogeneous graph data
+    """Load preprocessed graph data (heterogeneous or homogeneous)
     
     Returns:
-        If use_neighbor_sampling=True: (hetero_data, y_tx, y_tx_raw)
-        If use_neighbor_sampling=False: (x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask, val_mask, test_mask)
+        If use_neighbor_sampling=True: (hetero_data, y_tx, y_tx_raw) or (data, y_tx, y_tx_raw) for homogeneous
+        If use_neighbor_sampling=False: (x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask, val_mask, test_mask) 
+                                        or (x, edge_index, y_tx, y_tx_raw, train_mask, val_mask, test_mask) for homogeneous
     """
     if not Path(data_path).exists():
         raise FileNotFoundError(f"Data file not found: {data_path}")
@@ -117,6 +163,38 @@ def load_data(data_path, use_neighbor_sampling=False):
     # weights_only=False is required for torch_geometric data structures
     data = torch.load(data_path, weights_only=False)
     
+    # Check if it's homogeneous graph (Data) or heterogeneous graph (HeteroData)
+    is_homogeneous = isinstance(data, Data)
+    
+    if is_homogeneous:
+        # Homogeneous graph (Tx-only)
+        if use_neighbor_sampling:
+            # For homogeneous graph, return Data object directly
+            y_tx_raw = data.y.clone()
+            y_tx = y_tx_raw.clone()
+            label_map = {1: 1, 2: 0}  # illicit → 1, licit → 0
+            for old, new in label_map.items():
+                y_tx[y_tx_raw == old] = new
+            
+            return data, y_tx, y_tx_raw
+        else:
+            # Extract for full graph training
+            x = data.x
+            edge_index = data.edge_index
+            y_tx_raw = data.y
+            train_mask = data.train_mask
+            val_mask = data.val_mask
+            test_mask = data.test_mask
+            
+            # Map labels: 1(illicit/불법) → 1, 2(licit/정상) → 0
+            y_tx = y_tx_raw.clone()
+            label_map = {1: 1, 2: 0}  # illicit → 1, licit → 0
+            for old, new in label_map.items():
+                y_tx[y_tx_raw == old] = new
+            
+            return x, edge_index, y_tx, y_tx_raw, train_mask, val_mask, test_mask
+    
+    # Heterogeneous graph (original code)
     if use_neighbor_sampling:
         # Create HeteroData object for NeighborLoader
         hetero_data = HeteroData()
@@ -218,24 +296,76 @@ def compute_class_weights(y_tx, train_mask, device):
 # ============================================================
 # Training & Evaluation
 # ============================================================
-def train_epoch_full_graph(model, x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask, optimizer, class_weights=None):
+def train_epoch_full_graph(model, x_dict_or_x, edge_index_dict_or_edge_index, y_tx, y_tx_raw, train_mask, optimizer, class_weights=None, model_name="sage"):
     """Train for one epoch using full graph"""
     model.train()
     optimizer.zero_grad()
     
-    out_dict = model(x_dict, edge_index_dict)
-    logits_tx = out_dict["tx"]
-    
-    # Only labeled nodes (exclude unknown=-1)
-    mask = train_mask & (y_tx_raw != -1)
-    
-    if class_weights is not None:
-        # Ensure class_weights is on the same device as logits
-        if class_weights.device != logits_tx.device:
-            class_weights = class_weights.to(logits_tx.device)
-        loss = F.cross_entropy(logits_tx[mask], y_tx[mask], weight=class_weights)
+    # Check if homogeneous graph (HomoGAT)
+    if model_name == "homogat":
+        # Homogeneous graph: x_dict_or_x is x, edge_index_dict_or_edge_index is edge_index
+        logits_tx = model(x_dict_or_x, edge_index_dict_or_edge_index)
+        # Only labeled nodes (exclude unknown=-1)
+        mask = train_mask & (y_tx_raw != -1)
+        if class_weights is not None:
+            # Ensure class_weights is on the same device as logits
+            if class_weights.device != logits_tx.device:
+                class_weights = class_weights.to(logits_tx.device)
+            loss = F.cross_entropy(logits_tx[mask], y_tx[mask], weight=class_weights)
+        else:
+            loss = F.cross_entropy(logits_tx[mask], y_tx[mask])
+    # CARE-GNN uses its own loss method
+    elif model_name == "care":
+        # Note: CARE-GNN mini-batch training is handled separately in train_epoch_batch
+        # This path is for full graph training (when care_use_batch=False)
+        import time
+        forward_start = time.time()
+        x = x_dict_or_x
+        adj_lists = edge_index_dict_or_edge_index  # adj_lists (pre-converted)
+        labels = y_tx_raw
+        
+        # Verify adj_lists is a list
+        if not isinstance(adj_lists, list):
+            raise TypeError(
+                f"For CARE-GNN, edge_index_dict_or_edge_index must be a list (adj_lists), "
+                f"got {type(adj_lists)}. Expected format: [adj_list_dict1, adj_list_dict2, ...]"
+            )
+        
+        # Forward pass can be slow - add progress indication
+        loss = model.loss(x, adj_lists=adj_lists, labels=labels, train_flag=True, batch_nodes=None)
+        if time.time() - forward_start > 5.0:
+            print(f"      [CARE-GNN] Loss computation took {time.time() - forward_start:.2f}s")
+        
+        # Get logits (second forward pass - can be optimized)
+        logits_start = time.time()
+        logits_tx, _ = model(x, adj_lists=adj_lists, labels=labels, train_flag=True, batch_nodes=None)
+        if time.time() - logits_start > 5.0:
+            print(f"      [CARE-GNN] Logits computation took {time.time() - logits_start:.2f}s")
+    # MetaPathTxClassifier returns (logits, alpha, h_tx_fused) tuple
+    elif model_name == "metapath":
+        logits_tx, alpha, h_tx_fused = model(x_dict_or_x, edge_index_dict_or_edge_index)
+        # Only labeled nodes (exclude unknown=-1)
+        mask = train_mask & (y_tx_raw != -1)
+        if class_weights is not None:
+            # Ensure class_weights is on the same device as logits
+            if class_weights.device != logits_tx.device:
+                class_weights = class_weights.to(logits_tx.device)
+            loss = F.cross_entropy(logits_tx[mask], y_tx[mask], weight=class_weights)
+        else:
+            loss = F.cross_entropy(logits_tx[mask], y_tx[mask])
     else:
-        loss = F.cross_entropy(logits_tx[mask], y_tx[mask])
+        # Heterogeneous graph
+        out_dict = model(x_dict_or_x, edge_index_dict_or_edge_index)
+        logits_tx = out_dict["tx"]
+        # Only labeled nodes (exclude unknown=-1)
+        mask = train_mask & (y_tx_raw != -1)
+        if class_weights is not None:
+            # Ensure class_weights is on the same device as logits
+            if class_weights.device != logits_tx.device:
+                class_weights = class_weights.to(logits_tx.device)
+            loss = F.cross_entropy(logits_tx[mask], y_tx[mask], weight=class_weights)
+        else:
+            loss = F.cross_entropy(logits_tx[mask], y_tx[mask])
     
     loss.backward()
     optimizer.step()
@@ -243,7 +373,7 @@ def train_epoch_full_graph(model, x_dict, edge_index_dict, y_tx, y_tx_raw, train
     return float(loss.item())
 
 
-def train_epoch_neighbor_sampling(model, train_loader, device, optimizer, class_weights=None):
+def train_epoch_neighbor_sampling(model, train_loader, device, optimizer, class_weights=None, model_name="sage"):
     """Train for one epoch using neighbor sampling"""
     model.train()
     total_loss = 0.0
@@ -260,47 +390,110 @@ def train_epoch_neighbor_sampling(model, train_loader, device, optimizer, class_
             for edge_type in batch.edge_types
         }
         
-        # Forward pass
-        out_dict = model(x_dict, edge_index_dict)
-        logits_tx = out_dict["tx"]
-        
-        # Get labels and mask for training nodes in this batch
-        y_batch = batch["tx"].y
-        train_mask_batch = batch["tx"].train_mask
-        
-        # Only labeled nodes (exclude unknown=-1)
-        mask = train_mask_batch & (y_batch != -1)
-        
-        if mask.sum() > 0:
-            # Map labels: 1(illicit/불법) → 1, 2(licit/정상) → 0
-            y_batch_mapped = y_batch.clone()
-            label_map = {1: 1, 2: 0}  # illicit → 1, licit → 0
-            for old, new in label_map.items():
-                y_batch_mapped[y_batch == old] = new
+        # Forward pass - MetaPathTxClassifier returns (logits, alpha, h_tx_fused) tuple
+        if model_name == "metapath":
+            logits_tx, alpha, h_tx_fused = model(x_dict, edge_index_dict)
+            # Get labels and mask for training nodes in this batch
+            y_batch = batch["tx"].y
+            train_mask_batch = batch["tx"].train_mask
             
-            if class_weights is not None:
-                # Ensure class_weights is on the same device as logits
-                if class_weights.device != logits_tx.device:
-                    class_weights = class_weights.to(logits_tx.device)
-                loss = F.cross_entropy(logits_tx[mask], y_batch_mapped[mask], weight=class_weights)
-            else:
-                loss = F.cross_entropy(logits_tx[mask], y_batch_mapped[mask])
+            # Only labeled nodes (exclude unknown=-1)
+            mask = train_mask_batch & (y_batch != -1)
+            
+            if mask.sum() > 0:
+                # Map labels: 1(illicit/불법) → 1, 2(licit/정상) → 0
+                y_batch_mapped = y_batch.clone()
+                label_map = {1: 1, 2: 0}  # illicit → 1, licit → 0
+                for old, new in label_map.items():
+                    y_batch_mapped[y_batch == old] = new
+                
+                if class_weights is not None:
+                    # Ensure class_weights is on the same device as logits
+                    if class_weights.device != logits_tx.device:
+                        class_weights = class_weights.to(logits_tx.device)
+                    loss = F.cross_entropy(logits_tx[mask], y_batch_mapped[mask], weight=class_weights)
+                else:
+                    loss = F.cross_entropy(logits_tx[mask], y_batch_mapped[mask])
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += float(loss.item())
+                num_batches += 1
+        elif model_name == "care":
+            # CARE-GNN uses its own loss method
+            # Get labels for CARE-GNN (needs raw labels with -1 for unlabeled)
+            y_batch_raw = batch["tx"].y
+            labels_dict = {"tx": y_batch_raw}
+            loss = model.loss(x_dict, edge_index_dict, labels_dict, train_flag=True)
             loss.backward()
             optimizer.step()
             
             total_loss += float(loss.item())
             num_batches += 1
+        else:
+            out_dict = model(x_dict, edge_index_dict)
+            logits_tx = out_dict["tx"]
+            
+            # Get labels and mask for training nodes in this batch
+            y_batch = batch["tx"].y
+            train_mask_batch = batch["tx"].train_mask
+            
+            # Only labeled nodes (exclude unknown=-1)
+            mask = train_mask_batch & (y_batch != -1)
+            
+            if mask.sum() > 0:
+                # Map labels: 1(illicit/불법) → 1, 2(licit/정상) → 0
+                y_batch_mapped = y_batch.clone()
+                label_map = {1: 1, 2: 0}  # illicit → 1, licit → 0
+                for old, new in label_map.items():
+                    y_batch_mapped[y_batch == old] = new
+                
+                if class_weights is not None:
+                    # Ensure class_weights is on the same device as logits
+                    if class_weights.device != logits_tx.device:
+                        class_weights = class_weights.to(logits_tx.device)
+                    loss = F.cross_entropy(logits_tx[mask], y_batch_mapped[mask], weight=class_weights)
+                else:
+                    loss = F.cross_entropy(logits_tx[mask], y_batch_mapped[mask])
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += float(loss.item())
+                num_batches += 1
     
     return total_loss / max(num_batches, 1)
 
 
 @torch.no_grad()
-def evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, mask):
+def evaluate(model, x_dict_or_x, edge_index_dict_or_edge_index, y_tx, y_tx_raw, mask, model_name="sage"):
     """Evaluate on given mask using full graph"""
     model.eval()
     
-    out_dict = model(x_dict, edge_index_dict)
-    logits_tx = out_dict["tx"]
+    # Check if homogeneous graph (HomoGAT)
+    if model_name == "homogat":
+        # Homogeneous graph: x_dict_or_x is x, edge_index_dict_or_edge_index is edge_index
+        logits_tx = model(x_dict_or_x, edge_index_dict_or_edge_index)
+    # MetaPathTxClassifier returns (logits, alpha, h_tx_fused) tuple
+    elif model_name == "metapath":
+        logits_tx, alpha, h_tx_fused = model(x_dict_or_x, edge_index_dict_or_edge_index)
+    # CARE-GNN returns (scores, label_scores) tuple
+    elif model_name == "care":
+        x = x_dict_or_x
+        adj_lists = edge_index_dict_or_edge_index  # adj_lists (pre-converted)
+        
+        # Verify adj_lists is a list
+        if not isinstance(adj_lists, list):
+            raise TypeError(
+                f"For CARE-GNN, edge_index_dict_or_edge_index must be a list (adj_lists), "
+                f"got {type(adj_lists)}. Expected format: [adj_list_dict1, adj_list_dict2, ...]"
+            )
+        
+        logits_tx, label_scores = model(x, adj_lists=adj_lists, train_flag=False, batch_nodes=None)
+        logits_tx = logits_tx.cpu()
+    else:
+        # Heterogeneous graph
+        out_dict = model(x_dict_or_x, edge_index_dict_or_edge_index)
+        logits_tx = out_dict["tx"]
     
     eval_mask = mask & (y_tx_raw != -1)
     pred = logits_tx[eval_mask].argmax(dim=-1)
@@ -314,7 +507,7 @@ def evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, mask):
     
     acc = correct / total if total > 0 else 0.0
     
-    # Calculate precision, recall, f1, confusion matrix
+    # Calculate precision, recall, f1, auc, confusion matrix
     if total > 0:
         pred_np = pred.cpu().numpy()
         y_true_np = y_true.cpu().numpy()
@@ -322,11 +515,60 @@ def evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, mask):
         recall = recall_score(y_true_np, pred_np, average='binary', zero_division=0)
         f1 = f1_score(y_true_np, pred_np, average='binary', zero_division=0)
         cm = confusion_matrix(y_true_np, pred_np, labels=[0, 1])
+        # Calculate AUC using probability scores
+        probs = F.softmax(logits_tx[eval_mask], dim=-1)
+        y_probs = probs[:, 1].cpu().numpy()  # Probability of class 1 (사기/illicit)
+        try:
+            auc = roc_auc_score(y_true_np, y_probs)
+        except ValueError:
+            # Handle case where only one class is present
+            auc = 0.0
     else:
-        precision = recall = f1 = 0.0
+        precision = recall = f1 = auc = 0.0
         cm = np.array([[0, 0], [0, 0]])
+        y_probs = np.array([])
+        y_true_np = np.array([])
     
-    return acc, precision, recall, f1, loss, cm
+    # Calculate Precision@k and Recall@k
+    precision_at_k_dict = {}
+    recall_at_k_dict = {}
+    if total > 0 and len(y_probs) > 0:
+        # k values to compute (as percentages)
+        k_percentages = [1, 5, 10, 20, 50]
+        
+        for k_pct in k_percentages:
+            k = int(total * k_pct / 100)
+            if k == 0:
+                k = 1
+            if k > total:
+                k = total
+            
+            # Get top-k indices by probability
+            top_k_indices = np.argsort(y_probs)[-k:][::-1]
+            
+            # Predictions: top-k are positive (1), rest are negative (0)
+            top_k_pred = np.zeros_like(y_probs, dtype=int)
+            top_k_pred[top_k_indices] = 1
+            
+            # Calculate TP, FP, FN
+            tp = np.sum((top_k_pred == 1) & (y_true_np == 1))
+            fp = np.sum((top_k_pred == 1) & (y_true_np == 0))
+            fn = np.sum((top_k_pred == 0) & (y_true_np == 1))
+            
+            # Precision@k = TP / (TP + FP)
+            precision_at_k = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            
+            # Recall@k = TP / (TP + FN)
+            recall_at_k = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            
+            precision_at_k_dict[k_pct] = precision_at_k
+            recall_at_k_dict[k_pct] = recall_at_k
+    else:
+        for k_pct in [1, 5, 10, 20, 50]:
+            precision_at_k_dict[k_pct] = 0.0
+            recall_at_k_dict[k_pct] = 0.0
+    
+    return acc, precision, recall, f1, auc, loss, cm, precision_at_k_dict, recall_at_k_dict
 
 
 def print_relation_weights(model, edge_index_dict=None):
@@ -354,7 +596,7 @@ def print_relation_weights(model, edge_index_dict=None):
 
 
 @torch.no_grad()
-def evaluate_from_hetero_data(model, hetero_data, y_tx, y_tx_raw, mask_name, device):
+def evaluate_from_hetero_data(model, hetero_data, y_tx, y_tx_raw, mask_name, device, model_name="sage"):
     """Evaluate on given mask using full graph from HeteroData"""
     model.eval()
     
@@ -365,8 +607,16 @@ def evaluate_from_hetero_data(model, hetero_data, y_tx, y_tx_raw, mask_name, dev
         for edge_type in hetero_data.edge_types
     }
     
-    out_dict = model(x_dict, edge_index_dict)
-    logits_tx = out_dict["tx"].cpu()
+    # MetaPathTxClassifier returns (logits, alpha, h_tx_fused) tuple
+    if model_name == "metapath":
+        logits_tx, alpha, h_tx_fused = model(x_dict, edge_index_dict)
+        logits_tx = logits_tx.cpu()
+    # CARE-GNN should not use heterogeneous data
+    elif model_name == "care":
+        raise ValueError("CARE-GNN requires homogeneous graph data. Use evaluate() instead of evaluate_from_hetero_data()")
+    else:
+        out_dict = model(x_dict, edge_index_dict)
+        logits_tx = out_dict["tx"].cpu()
     
     # Get mask
     mask = hetero_data["tx"][mask_name].cpu()
@@ -383,7 +633,7 @@ def evaluate_from_hetero_data(model, hetero_data, y_tx, y_tx_raw, mask_name, dev
     
     acc = correct / total if total > 0 else 0.0
     
-    # Calculate precision, recall, f1, confusion matrix
+    # Calculate precision, recall, f1, auc, confusion matrix
     if total > 0:
         pred_np = pred.numpy()
         y_true_np = y_true.numpy()
@@ -391,11 +641,60 @@ def evaluate_from_hetero_data(model, hetero_data, y_tx, y_tx_raw, mask_name, dev
         recall = recall_score(y_true_np, pred_np, average='binary', zero_division=0)
         f1 = f1_score(y_true_np, pred_np, average='binary', zero_division=0)
         cm = confusion_matrix(y_true_np, pred_np, labels=[0, 1])
+        # Calculate AUC using probability scores
+        probs = F.softmax(logits_tx[eval_mask], dim=-1)
+        y_probs = probs[:, 1].numpy()  # Probability of class 1
+        try:
+            auc = roc_auc_score(y_true_np, y_probs)
+        except ValueError:
+            # Handle case where only one class is present
+            auc = 0.0
     else:
-        precision = recall = f1 = 0.0
+        precision = recall = f1 = auc = 0.0
         cm = np.array([[0, 0], [0, 0]])
+        y_probs = np.array([])
+        y_true_np = np.array([])
     
-    return acc, precision, recall, f1, loss, cm
+    # Calculate Precision@k and Recall@k
+    precision_at_k_dict = {}
+    recall_at_k_dict = {}
+    if total > 0 and len(y_probs) > 0:
+        # k values to compute (as percentages)
+        k_percentages = [1, 5, 10, 20, 50]
+        
+        for k_pct in k_percentages:
+            k = int(total * k_pct / 100)
+            if k == 0:
+                k = 1
+            if k > total:
+                k = total
+            
+            # Get top-k indices by probability
+            top_k_indices = np.argsort(y_probs)[-k:][::-1]
+            
+            # Predictions: top-k are positive (1), rest are negative (0)
+            top_k_pred = np.zeros_like(y_probs, dtype=int)
+            top_k_pred[top_k_indices] = 1
+            
+            # Calculate TP, FP, FN
+            tp = np.sum((top_k_pred == 1) & (y_true_np == 1))
+            fp = np.sum((top_k_pred == 1) & (y_true_np == 0))
+            fn = np.sum((top_k_pred == 0) & (y_true_np == 1))
+            
+            # Precision@k = TP / (TP + FP)
+            precision_at_k = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            
+            # Recall@k = TP / (TP + FN)
+            recall_at_k = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            
+            precision_at_k_dict[k_pct] = precision_at_k
+            recall_at_k_dict[k_pct] = recall_at_k
+    else:
+        for k_pct in [1, 5, 10, 20, 50]:
+            precision_at_k_dict[k_pct] = 0.0
+            recall_at_k_dict[k_pct] = 0.0
+    
+    return acc, precision, recall, f1, auc, loss, cm, precision_at_k_dict, recall_at_k_dict
 
 
 # ============================================================
@@ -458,98 +757,232 @@ def main():
     print("Loading data...")
     print("=" * 60)
     
-    if args.use_neighbor_sampling:
-        hetero_data, y_tx, y_tx_raw = load_data(args.data_path, use_neighbor_sampling=True)
-        
-        print(f"TX features: {hetero_data['tx'].x.shape}")
-        print(f"ADDR features: {hetero_data['addr'].x.shape}")
-        print(f"Label distribution: {torch.bincount(y_tx[y_tx >= 0])}")
-        print(f"Train/Val/Test: {hetero_data['tx'].train_mask.sum()}/{hetero_data['tx'].val_mask.sum()}/{hetero_data['tx'].test_mask.sum()}\n")
-        
-        # Get training node indices
-        train_idx = hetero_data["tx"].train_mask.nonzero(as_tuple=False).squeeze()
-        
-        # Setup neighbor sampling
-        num_neighbors = args.num_neighbors
-        if len(num_neighbors) != args.num_layers:
-            print(f"Warning: num_neighbors length ({len(num_neighbors)}) != num_layers ({args.num_layers})")
-            if len(num_neighbors) == 1:
-                num_neighbors = num_neighbors * args.num_layers
+    # CARE-GNN requires elliptic_tx_only.pt (homogeneous graph)
+    if args.model == "care":
+        if "tx_only" not in args.data_path:
+            print("=" * 60)
+            print("⚠️  Warning: CARE-GNN requires 'elliptic_tx_only.pt' data")
+            print(f"   Current data path: {args.data_path}")
+            print("   Forcing use of homogeneous graph data...")
+            print("=" * 60)
+            # Try to find elliptic_tx_only.pt in the same directory
+            data_dir = Path(args.data_path).parent
+            tx_only_path = data_dir / "elliptic_tx_only.pt"
+            if tx_only_path.exists():
+                args.data_path = str(tx_only_path)
+                print(f"   Using: {args.data_path}")
             else:
-                num_neighbors = num_neighbors[:args.num_layers]
+                raise ValueError(
+                    f"CARE-GNN requires 'elliptic_tx_only.pt' data.\n"
+                    f"Please generate it using: python preprocess_tx_only.py\n"
+                    f"Or specify the correct path with --data_path"
+                )
+        args.use_neighbor_sampling = False  # CARE-GNN doesn't support neighbor sampling
+    
+    # Check if homogeneous model (HomoGAT doesn't support neighbor sampling)
+    if args.model == "homogat" and args.use_neighbor_sampling:
+        print("⚠️  Warning: HomoGAT doesn't support neighbor sampling. Using full graph training.")
+        args.use_neighbor_sampling = False
+    
+    if args.use_neighbor_sampling:
+        loaded_data = load_data(args.data_path, use_neighbor_sampling=True)
         
-        # Create neighbor loader for training
-        train_loader = NeighborLoader(
-            hetero_data,
-            num_neighbors=num_neighbors,
-            input_nodes=("tx", train_idx),
-            batch_size=args.batch_size,
-            shuffle=True,
-        )
+        # Check if homogeneous or heterogeneous
+        if isinstance(loaded_data[0], Data):
+            # Homogeneous graph - neighbor sampling not supported, fall through to else block
+            print("⚠️  Warning: Neighbor sampling not supported for homogeneous graphs. Using full graph training.")
+            args.use_neighbor_sampling = False
+            # Will be handled in else block below
+        else:
+            hetero_data, y_tx, y_tx_raw = loaded_data
+            
+            print(f"TX features: {hetero_data['tx'].x.shape}")
+            print(f"ADDR features: {hetero_data['addr'].x.shape}")
+            print(f"Label distribution: {torch.bincount(y_tx[y_tx >= 0])}")
+            print(f"Train/Val/Test: {hetero_data['tx'].train_mask.sum()}/{hetero_data['tx'].val_mask.sum()}/{hetero_data['tx'].test_mask.sum()}\n")
+            
+            # Get training node indices
+            train_idx = hetero_data["tx"].train_mask.nonzero(as_tuple=False).squeeze()
+            
+            # Setup neighbor sampling
+            num_neighbors = args.num_neighbors
+            if len(num_neighbors) != args.num_layers:
+                print(f"Warning: num_neighbors length ({len(num_neighbors)}) != num_layers ({args.num_layers})")
+                if len(num_neighbors) == 1:
+                    num_neighbors = num_neighbors * args.num_layers
+                else:
+                    num_neighbors = num_neighbors[:args.num_layers]
+            
+            # Create neighbor loader for training
+            train_loader = NeighborLoader(
+                hetero_data,
+                num_neighbors=num_neighbors,
+                input_nodes=("tx", train_idx),
+                batch_size=args.batch_size,
+                shuffle=True,
+            )
+            
+            print(f"Neighbor sampling config:")
+            print(f"  Batch size: {args.batch_size}")
+            print(f"  Num neighbors per layer: {num_neighbors}")
+            print(f"  Training nodes: {len(train_idx)}\n")
+            
+            # For evaluation, prepare full graph data on device
+            x_dict_eval = {node_type: hetero_data[node_type].x for node_type in hetero_data.node_types}
+            edge_index_dict_eval = {
+                edge_type: hetero_data[edge_type].edge_index
+                for edge_type in hetero_data.edge_types
+            }
+            train_mask_eval = hetero_data["tx"].train_mask
+            val_mask_eval = hetero_data["tx"].val_mask
+            test_mask_eval = hetero_data["tx"].test_mask
+            
+            # Move to device
+            x_dict_eval = {k: v.to(device) for k, v in x_dict_eval.items()}
+            edge_index_dict_eval = {k: v.to(device) for k, v in edge_index_dict_eval.items()}
+            y_tx = y_tx.to(device)
+            y_tx_raw = y_tx_raw.to(device)
+            train_mask_eval = train_mask_eval.to(device)
+            val_mask_eval = val_mask_eval.to(device)
+            test_mask_eval = test_mask_eval.to(device)
+            
+            # Store for model creation
+            tx_feat_dim = hetero_data["tx"].x.size(1)
+            addr_feat_dim = hetero_data["addr"].x.size(1)
+    
+    if not args.use_neighbor_sampling:
+        loaded_data = load_data(args.data_path, use_neighbor_sampling=False)
         
-        print(f"Neighbor sampling config:")
-        print(f"  Batch size: {args.batch_size}")
-        print(f"  Num neighbors per layer: {num_neighbors}")
-        print(f"  Training nodes: {len(train_idx)}\n")
+        # Check if homogeneous or heterogeneous by checking first element type
+        # Homogeneous: first element is Tensor (x)
+        # Heterogeneous: first element is dict (x_dict)
+        is_homogeneous_data = isinstance(loaded_data[0], torch.Tensor)
         
-        # For evaluation, prepare full graph data on device
-        x_dict_eval = {node_type: hetero_data[node_type].x for node_type in hetero_data.node_types}
-        edge_index_dict_eval = {
-            edge_type: hetero_data[edge_type].edge_index
-            for edge_type in hetero_data.edge_types
-        }
-        train_mask_eval = hetero_data["tx"].train_mask
-        val_mask_eval = hetero_data["tx"].val_mask
-        test_mask_eval = hetero_data["tx"].test_mask
-        
-        # Move to device
-        x_dict_eval = {k: v.to(device) for k, v in x_dict_eval.items()}
-        edge_index_dict_eval = {k: v.to(device) for k, v in edge_index_dict_eval.items()}
-        y_tx = y_tx.to(device)
-        y_tx_raw = y_tx_raw.to(device)
-        train_mask_eval = train_mask_eval.to(device)
-        val_mask_eval = val_mask_eval.to(device)
-        test_mask_eval = test_mask_eval.to(device)
-        
-        # Store for model creation
-        tx_feat_dim = hetero_data["tx"].x.size(1)
-        addr_feat_dim = hetero_data["addr"].x.size(1)
-    else:
-        x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask, val_mask, test_mask = load_data(args.data_path, use_neighbor_sampling=False)
-        
-        print(f"TX features: {x_dict['tx'].shape}")
-        print(f"ADDR features: {x_dict['addr'].shape}")
-        print(f"Label distribution: {torch.bincount(y_tx[y_tx >= 0])}")
-        print(f"Train/Val/Test: {train_mask.sum()}/{val_mask.sum()}/{test_mask.sum()}\n")
-        
-        # Move to device
-        x_dict = {k: v.to(device) for k, v in x_dict.items()}
-        edge_index_dict = {k: v.to(device) for k, v in edge_index_dict.items()}
-        y_tx = y_tx.to(device)
-        y_tx_raw = y_tx_raw.to(device)
-        train_mask = train_mask.to(device)
-        val_mask = val_mask.to(device)
-        test_mask = test_mask.to(device)
-        
-        # Store for model creation
-        tx_feat_dim = x_dict["tx"].size(1)
-        addr_feat_dim = x_dict["addr"].size(1)
-        
-        # For compatibility
-        train_loader = None
-        hetero_data = None
-        x_dict_eval = x_dict
-        edge_index_dict_eval = edge_index_dict
-        train_mask_eval = train_mask
-        val_mask_eval = val_mask
-        test_mask_eval = test_mask
+        if is_homogeneous_data:  # Homogeneous: (x, edge_index, y_tx, y_tx_raw, train_mask, val_mask, test_mask)
+            x, edge_index, y_tx, y_tx_raw, train_mask, val_mask, test_mask = loaded_data
+            
+            print(f"TX features: {x.shape}")
+            print(f"Label distribution: {torch.bincount(y_tx[y_tx >= 0])}")
+            print(f"Train/Val/Test: {train_mask.sum()}/{val_mask.sum()}/{test_mask.sum()}\n")
+            
+            # Move to device
+            x = x.to(device)
+            edge_index = edge_index.to(device)
+            y_tx = y_tx.to(device)
+            y_tx_raw = y_tx_raw.to(device)
+            train_mask = train_mask.to(device)
+            val_mask = val_mask.to(device)
+            test_mask = test_mask.to(device)
+            
+            # Store for model creation
+            tx_feat_dim = x.size(1)
+            addr_feat_dim = None  # Not used for homogeneous
+            is_homogeneous_data = True
+            
+            # For CARE-GNN: prepare data with meta-relations
+            if args.model == "care":
+                from care_gnn_model import prepare_care_gnn_data
+                x, meta_relations, y_tx, y_tx_raw, train_mask, val_mask, test_mask = prepare_care_gnn_data(
+                    args.data_path, device=device
+                )
+                edge_index_dict_eval = meta_relations  # meta_relations dict
+                x_dict_eval = x  # Tensor for CARE-GNN
+            else:
+                edge_index_dict_eval = edge_index  # Tensor for other models
+                x_dict_eval = x  # Tensor for other models
+            
+            # For compatibility
+            train_loader = None
+            hetero_data = None
+            train_mask_eval = train_mask
+            val_mask_eval = val_mask
+            test_mask_eval = test_mask
+        else:  # Heterogeneous: (x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask, val_mask, test_mask)
+            is_homogeneous_data = False
+            x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask, val_mask, test_mask = loaded_data
+            
+            print(f"TX features: {x_dict['tx'].shape}")
+            print(f"ADDR features: {x_dict['addr'].shape}")
+            print(f"Label distribution: {torch.bincount(y_tx[y_tx >= 0])}")
+            print(f"Train/Val/Test: {train_mask.sum()}/{val_mask.sum()}/{test_mask.sum()}\n")
+            
+            # Move to device
+            x_dict = {k: v.to(device) for k, v in x_dict.items()}
+            edge_index_dict = {k: v.to(device) for k, v in edge_index_dict.items()}
+            y_tx = y_tx.to(device)
+            y_tx_raw = y_tx_raw.to(device)
+            train_mask = train_mask.to(device)
+            val_mask = val_mask.to(device)
+            test_mask = test_mask.to(device)
+            
+            # Store for model creation
+            tx_feat_dim = x_dict["tx"].size(1)
+            addr_feat_dim = x_dict["addr"].size(1)
+            
+            # For compatibility
+            train_loader = None
+            hetero_data = None
+            x_dict_eval = x_dict
+            edge_index_dict_eval = edge_index_dict
+            train_mask_eval = train_mask
+            val_mask_eval = val_mask
+            test_mask_eval = test_mask
     
     # Model setup
     print("=" * 60)
     print(f"Building model: {args.model.upper()}")
     print("=" * 60)
     
-    if args.model == "gat":
+    # Check if homogeneous model
+    is_homogeneous_model = args.model in ["homogat", "care"]
+    
+    # Check data-model compatibility (after data loading)
+    # is_homogeneous_data should be set in the data loading section above
+    # If not set (shouldn't happen), we'll check it here
+    if 'is_homogeneous_data' not in locals():
+        if args.use_neighbor_sampling:
+            # For neighbor sampling, check the loaded data type
+            loaded_data_check = load_data(args.data_path, use_neighbor_sampling=True)
+            is_homogeneous_data = isinstance(loaded_data_check[0], Data)
+        else:
+            # Check from loaded_data
+            loaded_data_check = load_data(args.data_path, use_neighbor_sampling=False)
+            is_homogeneous_data = isinstance(loaded_data_check[0], torch.Tensor)
+    
+    # Heterogeneous models (sage, gat, gcn, metapath) require heterogeneous data
+    if not is_homogeneous_model and is_homogeneous_data:
+        raise ValueError(
+            f"Model '{args.model}' requires heterogeneous graph data (with Address nodes),\n"
+            f"but provided data is homogeneous (Tx-only).\n"
+            f"Please use 'elliptic_hetero_static.pt' instead of 'elliptic_tx_only.pt',\n"
+            f"or use 'homogat' or 'care' model for homogeneous graph data."
+        )
+    
+    # Homogeneous model requires homogeneous data
+    if is_homogeneous_model and not is_homogeneous_data:
+        raise ValueError(
+            f"Model '{args.model}' requires homogeneous graph data (Tx-only),\n"
+            f"but provided data is heterogeneous.\n"
+            f"Please use 'elliptic_tx_only.pt' instead of 'elliptic_hetero_static.pt'."
+        )
+    
+    if is_homogeneous_model:
+        # HomoGAT model requires in_channels
+        if tx_feat_dim is None:
+            raise ValueError("HomoGAT requires homogeneous graph data (Tx-only)")
+        model_kwargs = {
+            "num_layers": args.num_layers,
+            "dropout": args.dropout,
+            "heads": args.heads,
+        }
+        model = get_model(
+            model_name=args.model,
+            in_channels=tx_feat_dim,
+            hidden_channels=args.hidden_channels,
+            out_channels=2,  # Binary classification
+            **model_kwargs
+        ).to(device)
+    elif args.model == "gat":
         # GAT model requires in_channels_dict and doesn't use aggr
         model_kwargs = {
             "num_layers": args.num_layers,
@@ -566,16 +999,99 @@ def main():
             out_channels=2,  # Binary classification
             **model_kwargs
         ).to(device)
+    elif args.model == "metapath":
+        # MetaPathTxClassifier model requires in_channels_dict
+        model_kwargs = {
+            "emb_dim": args.emb_dim,
+            "num_layers_tat": args.num_layers_tat,
+            "num_layers_ata": args.num_layers_ata,
+            "heads": args.heads,
+            "dropout": args.dropout,
+            "semantic_hidden_dim": args.semantic_hidden_dim,
+        }
+        model = get_model(
+            model_name=args.model,
+            in_channels_dict={
+                "tx": tx_feat_dim,
+                "addr": addr_feat_dim
+            },
+            hidden_channels=args.hidden_channels,
+            out_channels=2,  # Binary classification
+            **model_kwargs
+        ).to(device)
+    elif args.model == "care":
+        if not is_homogeneous_data:
+            raise ValueError(
+                "CARE-GNN requires homogeneous graph data (elliptic_tx_only.pt).\n"
+                "Please use 'elliptic_tx_only.pt' instead of heterogeneous data."
+            )
+        
+        model_kwargs = {
+            "embed_dim": args.hidden_channels,
+            "lambda_1": args.lambda_1,
+            "inter": "GNN",
+        }
+        model_kwargs["relation_names"] = None  # Determined from meta_relations
+        
+        model = get_model(
+            model_name=args.model,
+            in_channels=tx_feat_dim,
+            hidden_channels=args.hidden_channels,
+            out_channels=2,
+            **model_kwargs
+        ).to(device)
+    elif args.model == "hgt":
+        # HGT model requires in_channels_dict and heterogeneous graph data
+        if addr_feat_dim is None:
+            raise ValueError(
+                "HGT model requires heterogeneous graph data with Address nodes.\n"
+                "Please use 'elliptic_hetero_static.pt' instead of 'elliptic_tx_only.pt'."
+            )
+        
+        model_kwargs = {
+            "num_types": 2,  # tx and addr
+            "num_relations": 4,  # tx->tx, addr->addr, tx->addr, addr->tx
+            "n_heads": args.heads,
+            "num_layers": args.num_layers,
+            "dropout": args.dropout,
+            "conv_name": args.conv_name,
+            "prev_norm": args.prev_norm,
+            "last_norm": args.last_norm,
+            "use_RTE": args.use_RTE,
+            "care_temperature": args.care_temperature,
+            "fusion_mode": args.fusion_mode,
+        }
+        model = get_model(
+            model_name=args.model,
+            in_channels_dict={
+                "tx": tx_feat_dim,
+                "addr": addr_feat_dim
+            },
+            hidden_channels=args.hidden_channels,
+            out_channels=2,  # Binary classification
+            **model_kwargs
+        ).to(device)
     else:
         # SAGE, GCN, and GTNLite use in_channels and aggr (GTNLite ignores aggr)
+        # These models require heterogeneous graph data
+        if addr_feat_dim is None:
+            raise ValueError(
+                f"Model '{args.model}' requires heterogeneous graph data with Address nodes.\n"
+                f"Please use 'elliptic_hetero_static.pt' instead of 'elliptic_tx_only.pt'."
+            )
+        
         model_kwargs = {
             "num_layers": args.num_layers,
             "dropout": args.dropout,
             "aggr": args.aggr,
         }
+        # SAGE specific: use_neighbors option
+        if args.model == "sage":
+            model_kwargs["use_neighbors"] = not args.sage_no_neighbors
+        
         model = get_model(
             model_name=args.model,
-            in_channels=tx_feat_dim,
+            in_channels=tx_feat_dim,  # Note: HeteroSAGE uses same in_channels for both tx and addr
             hidden_channels=args.hidden_channels,
             out_channels=2,  # Binary classification
             **model_kwargs
@@ -624,7 +1140,7 @@ def main():
     print()
     
     # Optimizer
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay
@@ -643,26 +1159,87 @@ def main():
     best_test_metrics = None
     
     for epoch in range(1, args.epochs + 1):
+        print(f"\nEpoch {epoch}/{args.epochs}")
         # Training
         if args.use_neighbor_sampling:
-            train_loss = train_epoch_neighbor_sampling(model, train_loader, device, optimizer, class_weights)
+            train_loss = train_epoch_neighbor_sampling(model, train_loader, device, optimizer, class_weights, model_name=args.model)
             # Evaluation uses full graph
-            train_acc, train_prec, train_rec, train_f1, _, train_cm = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, train_mask_eval)
-            val_acc, val_prec, val_rec, val_f1, val_loss, val_cm = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, val_mask_eval)
-            test_acc, test_prec, test_rec, test_f1, _, test_cm = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, test_mask_eval)
+            # Note: neighbor sampling is only for heterogeneous graphs, so x_dict_eval and edge_index_dict_eval are always dicts
+            train_acc, train_prec, train_rec, train_f1, train_auc, _, train_cm, train_prec_at_k, train_rec_at_k = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, train_mask_eval, model_name=args.model)
+            val_acc, val_prec, val_rec, val_f1, val_auc, val_loss, val_cm, val_prec_at_k, val_rec_at_k = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, val_mask_eval, model_name=args.model)
+            test_acc, test_prec, test_rec, test_f1, test_auc, _, test_cm, test_prec_at_k, test_rec_at_k = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, test_mask_eval, model_name=args.model)
         else:
-            train_loss = train_epoch_full_graph(model, x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask, optimizer, class_weights)
-            train_acc, train_prec, train_rec, train_f1, _, train_cm = evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask)
-            val_acc, val_prec, val_rec, val_f1, val_loss, val_cm = evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, val_mask)
-            test_acc, test_prec, test_rec, test_f1, _, test_cm = evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, test_mask)
+            # Use appropriate data format based on model type
+            if is_homogeneous_model:
+                # Homogeneous graph: use x and edge_index (or meta_relations for CARE-GNN)
+                if args.model == "care":
+                    # CARE-GNN: 미니배치 또는 full graph 학습
+                    from care_gnn_model import train_epoch_batch, evaluate_batch
+                    
+                    if args.care_use_batch:
+                        # 미니배치 학습
+                        print(f"  Training (CARE-GNN mini-batch, batch_size={args.care_batch_size})...", end=" ", flush=True)
+                        train_loss = train_epoch_batch(
+                            model=model,
+                            x=x_dict_eval,
+                            adj_lists=edge_index_dict_eval,
+                            y_tx=y_tx,  # 매핑된 label 사용 (0, 1, -1)
+                            train_mask=train_mask_eval,
+                            optimizer=optimizer,
+                            batch_size=args.care_batch_size,
+                            device=device
+                        )
+                        print(f"Loss: {train_loss:.4f}")
+                        
+                        # 평가는 전체 그래프 사용
+                        train_acc, train_loss_eval, _, _ = evaluate_batch(
+                            model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, train_mask_eval, device
+                        )
+                        val_acc, val_loss, _, _ = evaluate_batch(
+                            model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, val_mask_eval, device
+                        )
+                        test_acc, _, _, _ = evaluate_batch(
+                            model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, test_mask_eval, device
+                        )
+                        
+                        # evaluate_batch는 accuracy와 loss만 반환하므로, 다른 메트릭은 evaluate 사용
+                        _, train_prec, train_rec, train_f1, train_auc, _, train_cm, train_prec_at_k, train_rec_at_k = evaluate(
+                            model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, train_mask_eval, model_name=args.model
+                        )
+                        _, val_prec, val_rec, val_f1, val_auc, _, val_cm, val_prec_at_k, val_rec_at_k = evaluate(
+                            model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, val_mask_eval, model_name=args.model
+                        )
+                        _, test_prec, test_rec, test_f1, test_auc, _, test_cm, test_prec_at_k, test_rec_at_k = evaluate(
+                            model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, test_mask_eval, model_name=args.model
+                        )
+                    else:
+                        # Full graph 학습 (기존 방식)
+                        print("  Training (CARE-GNN full graph - this may take a while for large graphs)...", end=" ", flush=True)
+                        train_loss = train_epoch_full_graph(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, train_mask_eval, optimizer, class_weights, model_name=args.model)
+                        print(f"Loss: {train_loss:.4f}")
+                        train_acc, train_prec, train_rec, train_f1, train_auc, _, train_cm, train_prec_at_k, train_rec_at_k = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, train_mask_eval, model_name=args.model)
+                        val_acc, val_prec, val_rec, val_f1, val_auc, val_loss, val_cm, val_prec_at_k, val_rec_at_k = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, val_mask_eval, model_name=args.model)
+                        test_acc, test_prec, test_rec, test_f1, test_auc, _, test_cm, test_prec_at_k, test_rec_at_k = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, test_mask_eval, model_name=args.model)
+                else:
+                    # Other homogeneous models (e.g., HomoGAT): use x and edge_index
+                    train_loss = train_epoch_full_graph(model, x, edge_index, y_tx, y_tx_raw, train_mask, optimizer, class_weights, model_name=args.model)
+                    train_acc, train_prec, train_rec, train_f1, train_auc, _, train_cm, train_prec_at_k, train_rec_at_k = evaluate(model, x, edge_index, y_tx, y_tx_raw, train_mask, model_name=args.model)
+                    val_acc, val_prec, val_rec, val_f1, val_auc, val_loss, val_cm, val_prec_at_k, val_rec_at_k = evaluate(model, x, edge_index, y_tx, y_tx_raw, val_mask, model_name=args.model)
+                    test_acc, test_prec, test_rec, test_f1, test_auc, _, test_cm, test_prec_at_k, test_rec_at_k = evaluate(model, x, edge_index, y_tx, y_tx_raw, test_mask, model_name=args.model)
+            else:
+                # Heterogeneous graph: use x_dict and edge_index_dict
+                train_loss = train_epoch_full_graph(model, x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask, optimizer, class_weights, model_name=args.model)
+                train_acc, train_prec, train_rec, train_f1, train_auc, _, train_cm, train_prec_at_k, train_rec_at_k = evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask, model_name=args.model)
+                val_acc, val_prec, val_rec, val_f1, val_auc, val_loss, val_cm, val_prec_at_k, val_rec_at_k = evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, val_mask, model_name=args.model)
+                test_acc, test_prec, test_rec, test_f1, test_auc, _, test_cm, test_prec_at_k, test_rec_at_k = evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, test_mask, model_name=args.model)
         
         # Update best
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_test_acc = test_acc
             best_epoch = epoch
-            best_val_metrics = (val_acc, val_prec, val_rec, val_f1, val_cm)
-            best_test_metrics = (test_acc, test_prec, test_rec, test_f1, test_cm)
+            best_val_metrics = (val_acc, val_prec, val_rec, val_f1, val_auc, val_cm, val_prec_at_k, val_rec_at_k)
+            best_test_metrics = (test_acc, test_prec, test_rec, test_f1, test_auc, test_cm, test_prec_at_k, test_rec_at_k)
             
             # Save model
             if args.save_model:
@@ -674,10 +1251,12 @@ def main():
                     'val_precision': val_prec,
                     'val_recall': val_rec,
                     'val_f1': val_f1,
+                    'val_auc': val_auc,
                     'test_acc': test_acc,
                     'test_precision': test_prec,
                     'test_recall': test_rec,
                     'test_f1': test_f1,
+                    'test_auc': test_auc,
                     'args': vars(args),
                 }, args.model_save_path)
         
@@ -686,15 +1265,25 @@ def main():
             f"Epoch {epoch:03d}/{args.epochs} | "
             f"Train Loss: {train_loss:.4f} | "
             f"Val Loss: {val_loss:.4f} | "
-            f"Train: Prec={train_prec:.4f} Rec={train_rec:.4f} F1={train_f1:.4f} | "
-            f"Val: Prec={val_prec:.4f} Rec={val_rec:.4f} F1={val_f1:.4f} | "
-            f"Test: Prec={test_prec:.4f} Rec={test_rec:.4f} F1={test_f1:.4f}"
+            f"Train: Prec={train_prec:.4f} Rec={train_rec:.4f} F1={train_f1:.4f} AUC={train_auc:.4f} | "
+            f"Val: Prec={val_prec:.4f} Rec={val_rec:.4f} F1={val_f1:.4f} AUC={val_auc:.4f} | "
+            f"Test: Prec={test_prec:.4f} Rec={test_rec:.4f} F1={test_f1:.4f} AUC={test_auc:.4f}"
         )
+        
+        # Print Precision@k and Recall@k for test set
+        print("  Test Precision@k: ", end="")
+        for k_pct in [1, 5, 10, 20, 50]:
+            print(f"@{k_pct}%={test_prec_at_k.get(k_pct, 0.0):.4f} ", end="")
+        print()
+        print("  Test Recall@k:    ", end="")
+        for k_pct in [1, 5, 10, 20, 50]:
+            print(f"@{k_pct}%={test_rec_at_k.get(k_pct, 0.0):.4f} ", end="")
+        print()
         if best_val_metrics:
             print(
                 f"  Best @E{best_epoch}: "
-                f"Val(Prec={best_val_metrics[1]:.4f} Rec={best_val_metrics[2]:.4f} F1={best_val_metrics[3]:.4f}) | "
-                f"Test(Prec={best_test_metrics[1]:.4f} Rec={best_test_metrics[2]:.4f} F1={best_test_metrics[3]:.4f})"
+                f"Val(Prec={best_val_metrics[1]:.4f} Rec={best_val_metrics[2]:.4f} F1={best_val_metrics[3]:.4f} AUC={best_val_metrics[4]:.4f}) | "
+                f"Test(Prec={best_test_metrics[1]:.4f} Rec={best_test_metrics[2]:.4f} F1={best_test_metrics[3]:.4f} AUC={best_test_metrics[4]:.4f})"
             )
     
     # Final results
@@ -707,8 +1296,9 @@ def main():
         print(f"  Precision: {best_val_metrics[1]:.4f}")
         print(f"  Recall:    {best_val_metrics[2]:.4f}")
         print(f"  F1-Score:  {best_val_metrics[3]:.4f}")
+        print(f"  AUC:       {best_val_metrics[4]:.4f}")
         print(f"\nValidation Confusion Matrix:")
-        val_cm = best_val_metrics[4]
+        val_cm = best_val_metrics[5]
         print(f"                Predicted")
         print(f"              Class 0  Class 1")
         print(f"  Actual 0    {val_cm[0,0]:6d}  {val_cm[0,1]:6d}")
@@ -717,12 +1307,23 @@ def main():
         print(f"  Precision: {best_test_metrics[1]:.4f}")
         print(f"  Recall:    {best_test_metrics[2]:.4f}")
         print(f"  F1-Score:  {best_test_metrics[3]:.4f}")
+        print(f"  AUC:       {best_test_metrics[4]:.4f}")
         print(f"\nTest Confusion Matrix:")
-        test_cm = best_test_metrics[4]
+        test_cm = best_test_metrics[5]
         print(f"                Predicted")
         print(f"              Class 0  Class 1")
         print(f"  Actual 0    {test_cm[0,0]:6d}  {test_cm[0,1]:6d}")
         print(f"  Actual 1    {test_cm[1,0]:6d}  {test_cm[1,1]:6d}")
+        
+        # Print Precision@k and Recall@k for best test metrics
+        best_test_prec_at_k = best_test_metrics[6] if len(best_test_metrics) > 6 else {}
+        best_test_rec_at_k = best_test_metrics[7] if len(best_test_metrics) > 7 else {}
+        print(f"\nBest Test Precision@k:")
+        for k_pct in [1, 5, 10, 20, 50]:
+            print(f"  @{k_pct}%: {best_test_prec_at_k.get(k_pct, 0.0):.4f}")
+        print(f"\nBest Test Recall@k:")
+        for k_pct in [1, 5, 10, 20, 50]:
+            print(f"  @{k_pct}%: {best_test_rec_at_k.get(k_pct, 0.0):.4f}")
     else:
         print(f"Best epoch: {best_epoch}")
     
