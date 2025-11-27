@@ -134,7 +134,7 @@ def get_args():
                        help="Device to use (auto/cuda/cpu)")
     
     # Seed
-    parser.add_argument("--seed", type=int, default=88,
+    parser.add_argument("--seed", type=int, default=42,
                        help="Random seed for reproducibility")
     
     # Save
