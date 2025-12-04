@@ -52,7 +52,11 @@ def get_args():
     
     # Model
     parser.add_argument("--model", type=str, default="sage", 
+<<<<<<< HEAD
                        choices=["sage", "gat", "gcn", "metapath", "homogat", "hgt", "gat_multitask"],
+=======
+                       choices=["sage", "gat", "gcn", "metapath", "homogat", "hgt"],
+>>>>>>> 08d1efb206174372632362e9283833f3b1a4ec36
                        help="Model architecture")
     parser.add_argument("--hidden_channels", type=int, default=64,
                        help="Hidden layer dimension")
@@ -123,7 +127,11 @@ def get_args():
                        help="Device to use (auto/cuda/cpu)")
     
     # Seed
+<<<<<<< HEAD
     parser.add_argument("--seed", type=int, default=2,
+=======
+    parser.add_argument("--seed", type=int, default=42,
+>>>>>>> 08d1efb206174372632362e9283833f3b1a4ec36
                        help="Random seed for reproducibility")
     
     # Save
@@ -1079,6 +1087,7 @@ def main():
             out_channels=2,  # Binary classification
             **model_kwargs
         ).to(device)
+<<<<<<< HEAD
     elif args.model == "metapath":
         # MetaPathTxClassifier model requires in_channels_dict
         model_kwargs = {
@@ -1099,6 +1108,8 @@ def main():
             out_channels=2,  # Binary classification
             **model_kwargs
         ).to(device)
+=======
+>>>>>>> 08d1efb206174372632362e9283833f3b1a4ec36
     elif args.model == "hgt":
         # HGT model requires in_channels_dict and heterogeneous graph data
         if addr_feat_dim is None:
