@@ -2,109 +2,281 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Linear, LayerNorm, Dropout, init
-from torch_geometric.nn import SAGEConv, HeteroConv, GATConv, GCNConv, GraphConv
+from torch_geometric.nn import SAGEConv, HeteroConv, GATConv, GCNConv, GraphConv, BatchNorm
 from torch_scatter import scatter_mean, scatter_add
 
 
-class HeteroSAGE(torch.nn.Module):
+class HeteroSAGE(nn.Module):
     """
-    Heterogeneous GraphSAGE model
+    개선된 Heterogeneous GraphSAGE
     
-    Args:
-        in_channels: Input feature dimension
-        hidden_channels: Hidden layer dimension
-        out_channels: Output dimension (number of classes)
-        num_layers: Number of graph convolution layers (default: 2)
-        dropout: Dropout rate (default: 0.5)
-        aggr: Aggregation method for HeteroConv (default: "sum")
-        use_neighbors: If False, only use self-loops (ignore graph structure) (default: True)
+    개선 사항:
+    1. Residual connection 깊은 복사 (메모리 누수 방지)
+    2. Last layer에도 activation 적용
+    3. Batch Norm + Layer Norm 조합
+    4. 이웃 aggregation 후 Concatenation (자신 특성 보존)
+    5. 선택적 Self-loop 지원
+    6. Neighborhood sampling 지원 인터페이스
     """
     def __init__(
-        self, 
-        in_channels, 
-        hidden_channels, 
-        out_channels,
+        self,
+        in_channels_dict,
+        hidden_channels=64,
+        out_channels=2,
         num_layers=2,
-        dropout=0.5,
-        aggr="sum",
-        use_neighbors=True
+        dropout=0.3,
+        aggr="mean",
+        use_concat=True,  # GraphSAGE concat 구현
+        use_batch_norm=True,  # Batch Norm + Layer Norm
+        use_self_loop=True,  # Self-loop 포함
+        use_neighbors=True,  # 이웃 노드 사용 여부 (False면 self-loop만 사용)
     ):
         super().__init__()
         self.num_layers = num_layers
+        self.hidden_channels = hidden_channels
         self.dropout = dropout
+        self.out_channels = out_channels
+        self.aggr = aggr
+        self.use_concat = use_concat
+        self.use_batch_norm = use_batch_norm
+        self.use_self_loop = use_self_loop
         self.use_neighbors = use_neighbors
         
-        self.convs = torch.nn.ModuleList()
-        
-        # First layer
-        self.convs.append(
-            HeteroConv({
-                ("tx", "to", "tx"):     SAGEConv(in_channels, hidden_channels),
-                ("addr", "to", "addr"): SAGEConv(in_channels, hidden_channels),
-                ("addr", "to", "tx"):   SAGEConv(in_channels, hidden_channels),
-                ("tx", "to", "addr"):   SAGEConv(in_channels, hidden_channels),
-            }, aggr=aggr)
-        )
-        
-        # Middle layers
-        for _ in range(num_layers - 2):
-            self.convs.append(
-                HeteroConv({
-                    ("tx", "to", "tx"):     SAGEConv(hidden_channels, hidden_channels),
-                    ("addr", "to", "addr"): SAGEConv(hidden_channels, hidden_channels),
-                    ("addr", "to", "tx"):   SAGEConv(hidden_channels, hidden_channels),
-                    ("tx", "to", "addr"):   SAGEConv(hidden_channels, hidden_channels),
-                }, aggr=aggr)
-            )
-        
-        # Last layer
-        self.convs.append(
-            HeteroConv({
-                ("tx", "to", "tx"):     SAGEConv(hidden_channels, out_channels),
-                ("addr", "to", "addr"): SAGEConv(hidden_channels, out_channels),
-                ("addr", "to", "tx"):   SAGEConv(hidden_channels, out_channels),
-                ("tx", "to", "addr"):   SAGEConv(hidden_channels, out_channels),
-            }, aggr=aggr)
+        # Concat 사용 시: out = hidden_channels * 2 (neighbor + self)
+        # 아니면: out = hidden_channels
+        self.conv_out_channels = hidden_channels * 2 if use_concat else hidden_channels
+
+        # 1. 타입별 입력 투영
+        self.input_projs = nn.ModuleDict()
+        for node_type, in_channels in in_channels_dict.items():
+            self.input_projs[node_type] = Linear(in_channels, hidden_channels)
+
+        # 2. Hetero GraphSAGE 레이어들
+        self.convs = nn.ModuleList()
+        self.norms_batch = nn.ModuleDict() if use_batch_norm else None
+        self.norms_layer = nn.ModuleDict()
+
+        for layer_idx in range(num_layers):
+            # use_concat=True일 때: 첫 번째 레이어는 hidden_channels, 이후 레이어는 hidden_channels * 2
+            # use_concat=False일 때: 모든 레이어는 hidden_channels
+            if layer_idx == 0:
+                layer_in_channels = hidden_channels
+            else:
+                layer_in_channels = self.conv_out_channels if use_concat else hidden_channels
+            
+            # 실제 데이터 구조에 맞는 엣지 타입 사용
+            # build_graph.py에서 사용하는 엣지 타입:
+            # - ('addr', 'addr_to_tx', 'tx'): Address -> Transaction
+            # - ('tx', 'tx_to_addr', 'addr'): Transaction -> Address
+            # - ('tx', 'tx_to_tx', 'tx'): Transaction -> Transaction (선택적)
+            # - ('addr', 'addr_to_addr', 'addr'): Address -> Address (선택적)
+            conv_dict = {
+                # 이종 그래프 엣지 (항상 존재)
+                ("addr", "addr_to_tx", "tx"): SAGEConv(
+                    in_channels=layer_in_channels,
+                    out_channels=hidden_channels,
+                    aggr=aggr,
+                ),
+                ("tx", "tx_to_addr", "addr"): SAGEConv(
+                    in_channels=layer_in_channels,
+                    out_channels=hidden_channels,
+                    aggr=aggr,
+                ),
+                # 동종 그래프 엣지 (선택적이지만 포함)
+                ("tx", "tx_to_tx", "tx"): SAGEConv(
+                    in_channels=layer_in_channels,
+                    out_channels=hidden_channels,
+                    aggr=aggr,
+                ),
+                ("addr", "addr_to_addr", "addr"): SAGEConv(
+                    in_channels=layer_in_channels,
+                    out_channels=hidden_channels,
+                    aggr=aggr,
+                ),
+            }
+            self.convs.append(HeteroConv(conv_dict, aggr="sum"))
+
+            # Batch Norm (선택적)
+            # BatchNorm은 concat 후에 적용되므로, 각 레이어마다 concat 후 차원 계산
+            if use_batch_norm and self.norms_batch is not None:
+                for node_type in in_channels_dict.keys():
+                    key = f"{node_type}_layer{layer_idx}"
+                    # use_concat=True일 때: 각 레이어마다 concat 후 차원이 다름
+                    # layer_idx=0: hidden_channels * 2
+                    # layer_idx>0: hidden_channels * (2 + layer_idx)
+                    if use_concat:
+                        norm_dim = hidden_channels * (2 + layer_idx)
+                    else:
+                        norm_dim = hidden_channels
+                    self.norms_batch[key] = BatchNorm(norm_dim)
+
+            # Layer Norm (항상 적용)
+            # LayerNorm도 concat 후에 적용되므로, 각 레이어마다 concat 후 차원 계산
+            for node_type in in_channels_dict.keys():
+                key = f"{node_type}_layer{layer_idx}"
+                # use_concat=True일 때: 각 레이어마다 concat 후 차원이 다름
+                if use_concat:
+                    norm_dim = hidden_channels * (2 + layer_idx)
+                else:
+                    norm_dim = hidden_channels
+                self.norms_layer[key] = LayerNorm(norm_dim)
+
+        # 3. Tx 전용 분류 헤드
+        # Last layer embedding -> logits (with activation)
+        # 마지막 레이어의 concat 후 차원 계산
+        if use_concat:
+            last_layer_dim = hidden_channels * (2 + num_layers - 1)  # hidden_channels * (1 + num_layers)
+        else:
+            last_layer_dim = hidden_channels
+        self.tx_classifier = nn.Sequential(
+            Linear(last_layer_dim, hidden_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            Linear(hidden_channels, out_channels),
         )
 
-    def forward(self, x_dict, edge_index_dict):
-        # If use_neighbors=False, create self-loop only edge_index_dict
-        if not self.use_neighbors:
-            edge_index_dict = self._create_self_loop_edges(x_dict)
-        
-        for i, conv in enumerate(self.convs):
-            x_dict = conv(x_dict, edge_index_dict)
-            
-            # Apply activation and dropout except for the last layer
-            if i < self.num_layers - 1:
-                x_dict = {k: F.relu(v) for k, v in x_dict.items()}
-                x_dict = {k: F.dropout(v, p=self.dropout, training=self.training)
-                         for k, v in x_dict.items()}
-        
-        return x_dict
-    
-    def _create_self_loop_edges(self, x_dict):
+    def forward(self, x_dict, edge_index_dict, batch=None):
         """
-        Create edge_index_dict with self-loops only (no neighbor connections)
-        
         Args:
-            x_dict: Dictionary of node features {node_type: [N_type, F_type]}
+            x_dict: node_type별 입력 특성
+            edge_index_dict: relation별 edge indices
+            batch: (선택) mini-batch 정보 (Batch Norm용)
         
         Returns:
-            edge_index_dict: Dictionary with self-loop edges only
+            x_dict: 
+                - "tx": logits [N_tx, out_channels]
+                - "addr": embedding [N_addr, conv_out_channels]
         """
-        device = next(iter(x_dict.values())).device
-        self_loop_edge_dict = {}
+        # Step 1: 타입별 입력 투영
+        x_dict = {
+            node_type: self.input_projs[node_type](x)
+            for node_type, x in x_dict.items()
+        }
+
+        # Step 2: GraphSAGE 레이어들
+        for layer_idx, conv in enumerate(self.convs):
+            # residual connection을 위한 복사 (clone만 사용, deepcopy는 PyTorch 텐서에서 작동하지 않음)
+            x_res = {k: v.clone() for k, v in x_dict.items()}
+            
+            # Convolution
+            # use_neighbors=False일 때는 빈 edge_index_dict 사용 (self-loop만)
+            if not self.use_neighbors:
+                # 빈 edge_index_dict 생성 (self-loop만 사용)
+                empty_edge_index_dict = {
+                    edge_type: torch.empty((2, 0), dtype=torch.long, device=next(iter(x_dict.values())).device)
+                    for edge_type in edge_index_dict.keys()
+                }
+                x_dict = conv(x_dict, empty_edge_index_dict)
+            else:
+                x_dict = conv(x_dict, edge_index_dict)
+
+            # 모든 레이어에 정규화 및 활성화 적용
+            new_x_dict = {}
+            for node_type, x in x_dict.items():
+                # use_concat=True일 때: 자기 자신의 특성과 concat
+                if self.use_concat and node_type in x_res:
+                    # SAGEConv 출력과 자기 자신의 특성을 concat
+                    x = torch.cat([x_res[node_type], x], dim=-1)  # [N, hidden_channels * 2]
+                else:
+                    # use_concat=False일 때: residual connection만 사용
+                    if node_type in x_res and x_res[node_type].shape == x.shape:
+                        x = x + x_res[node_type]
+                
+                # Batch Norm (선택적)
+                if self.use_batch_norm and self.norms_batch is not None:
+                    key = f"{node_type}_layer{layer_idx}"
+                    # batch가 None이면 전달하지 않음 (full graph 학습)
+                    # batch가 dict인 경우 해당 노드 타입의 batch 사용
+                    if batch is not None and isinstance(batch, dict):
+                        batch_for_node = batch.get(node_type, None)
+                        if batch_for_node is not None:
+                            x = self.norms_batch[key](x, batch_for_node)
+                        else:
+                            x = self.norms_batch[key](x)
+                    elif batch is not None:
+                        x = self.norms_batch[key](x, batch)
+                    else:
+                        x = self.norms_batch[key](x)
+
+                # Layer Norm
+                key = f"{node_type}_layer{layer_idx}"
+                x = self.norms_layer[key](x)
+
+                # Activation (마지막 레이어 포함!)
+                x = F.relu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
+                
+                new_x_dict[node_type] = x
+
+            x_dict = new_x_dict
+
+        # Step 3: Tx embedding에 classifier head 적용
+        if "tx" not in x_dict:
+            raise KeyError("x_dict does not contain 'tx' node type.")
+
+        tx_emb = x_dict["tx"]
+        logits = self.tx_classifier(tx_emb)
+
+        x_dict["tx"] = logits
+        return x_dict
+
+    def inference(self, x_dict, subgraph_loaders):
+        """
+        Inference 시 전체 그래프를 처리 (메모리 효율적)
+        Neighborhood sampling을 활용한 미니배치 추론
         
-        for node_type, features in x_dict.items():
-            num_nodes = features.size(0)
-            # Create self-loop edge_index: [0, 1, 2, ..., N-1] -> [0, 1, 2, ..., N-1]
-            self_loop_indices = torch.arange(num_nodes, device=device)
-            self_loop_edge_dict[(node_type, "to", node_type)] = torch.stack([
-                self_loop_indices, self_loop_indices
-            ], dim=0)
+        Args:
+            x_dict: 노드 특성 dict
+            subgraph_loaders: NeighborLoader 리스트 (각 레이어마다)
         
-        return self_loop_edge_dict
+        Returns:
+            x_dict: 최종 embedding
+        """
+        device = next(self.parameters()).device
+        
+        # 입력 투영
+        x_dict = {
+            node_type: self.input_projs[node_type](x).to(device)
+            for node_type, x in x_dict.items()
+        }
+
+        # 각 레이어별로 미니배치 처리
+        for layer_idx, (conv, loader) in enumerate(
+            zip(self.convs, subgraph_loaders)
+        ):
+            # 새로운 embedding 수집
+            ys = {node_type: [] for node_type in x_dict.keys()}
+
+            for batch in loader:
+                batch = batch.to(device)
+                
+                # 배치의 부분 그래프 처리
+                out = conv(
+                    {k: x_dict[k][batch.nodes[k]] 
+                     for k in batch.nodes.keys()},
+                    batch.edge_index_dict
+                )
+
+                # Normalization + Activation
+                for node_type, x in out.items():
+                    key = f"{node_type}_layer{layer_idx}"
+                    if self.use_batch_norm and self.norms_batch is not None:
+                        x = self.norms_batch[key](x, batch.batch)
+                    x = self.norms_layer[key](x)
+                    x = F.relu(x)
+                    ys[node_type].append(x.cpu())
+
+            # 배치 결과 연결
+            x_dict = {
+                node_type: torch.cat(ys[node_type], dim=0)
+                for node_type in ys.keys()
+            }
+
+        # Tx 분류
+        logits = self.tx_classifier(x_dict["tx"])
+        x_dict["tx"] = logits
+        return x_dict
+        
 
 class HomoGAT(nn.Module):
     """
@@ -240,8 +412,8 @@ class HeteroGAT(torch.nn.Module):
         hidden_channels=64,
         out_channels=2,
         num_layers=2,
-        heads=4,
-        dropout=0.5,
+        heads=2,
+        dropout=0.3,
     ):
         super().__init__()
         self.num_layers = num_layers
@@ -273,28 +445,28 @@ class HeteroGAT(torch.nn.Module):
         self.convs.append(
             HeteroConv(
                 {
-                    ("tx", "to", "tx"): GATConv(
+                    ("tx", "tx_to_tx", "tx"): GATConv(
                         hidden_channels,
                         hidden_channels,
                         heads=heads,
                         add_self_loops=True,
                         concat=True,
                     ),
-                    ("addr", "to", "addr"): GATConv(
+                    ("addr", "addr_to_addr", "addr"): GATConv(
                         hidden_channels,
                         hidden_channels,
                         heads=heads,
                         add_self_loops=True,
                         concat=True,
                     ),
-                    ("addr", "to", "tx"): GATConv(
+                    ("addr", "addr_to_tx", "tx"): GATConv(
                         hidden_channels,
                         hidden_channels,
                         heads=heads,
                         add_self_loops=False,
                         concat=True,
                     ),
-                    ("tx", "to", "addr"): GATConv(
+                    ("tx", "tx_to_addr", "addr"): GATConv(
                         hidden_channels,
                         hidden_channels,
                         heads=heads,
@@ -312,28 +484,28 @@ class HeteroGAT(torch.nn.Module):
             self.convs.append(
                 HeteroConv(
                     {
-                        ("tx", "to", "tx"): GATConv(
+                        ("tx", "tx_to_tx", "tx"): GATConv(
                             hidden_out_dim,
                             hidden_channels,
                             heads=heads,
                             add_self_loops=True,
                             concat=True,
                         ),
-                        ("addr", "to", "addr"): GATConv(
+                        ("addr", "addr_to_addr", "addr"): GATConv(
                             hidden_out_dim,
                             hidden_channels,
                             heads=heads,
                             add_self_loops=True,
                             concat=True,
                         ),
-                        ("addr", "to", "tx"): GATConv(
+                        ("addr", "addr_to_tx", "tx"): GATConv(
                             hidden_out_dim,
                             hidden_channels,
                             heads=heads,
                             add_self_loops=False,
                             concat=True,
                         ),
-                        ("tx", "to", "addr"): GATConv(
+                        ("tx", "tx_to_addr", "addr"): GATConv(
                             hidden_out_dim,
                             hidden_channels,
                             heads=heads,
@@ -346,18 +518,18 @@ class HeteroGAT(torch.nn.Module):
             )
 
         # ── 마지막 레이어: (hidden * heads) -> (hidden * heads) ─
-        #     → Tx 타깃만 업데이트: ("tx","to","tx"), ("addr","to","tx")
+        #     → Tx 타깃만 업데이트: ("tx","tx_to_tx","tx"), ("addr","addr_to_tx","tx")
         self.convs.append(
             HeteroConv(
                 {
-                    ("tx", "to", "tx"): GATConv(
+                    ("tx", "tx_to_tx", "tx"): GATConv(
                         hidden_out_dim,
                         hidden_channels,
                         heads=heads,
                         add_self_loops=True,
                         concat=True,
                     ),
-                    ("addr", "to", "tx"): GATConv(
+                    ("addr", "addr_to_tx", "tx"): GATConv(
                         hidden_out_dim,
                         hidden_channels,
                         heads=heads,
@@ -1490,6 +1662,11 @@ class HeteroHGT(torch.nn.Module):
 # ============================================================
 from care_gnn_model import OneLayerCARE
 
+# ============================================================
+# Multi-task GAT Model - Imported from model2.py
+# ============================================================
+from model2 import HeteroGATMultiTask
+
 
 def get_model(model_name, in_channels=None, in_channels_dict=None, hidden_channels=64, out_channels=2, **kwargs):
     """
@@ -1515,6 +1692,7 @@ def get_model(model_name, in_channels=None, in_channels_dict=None, hidden_channe
         "homogat": HomoGAT,
         "care": OneLayerCARE,
         "hgt": HeteroHGT,
+        "gat_multitask": HeteroGATMultiTask,
     }
     
     # Add gtnlite if available
@@ -1561,8 +1739,8 @@ def get_model(model_name, in_channels=None, in_channels_dict=None, hidden_channe
             care_temperature=kwargs.get("care_temperature", 1.0),
             fusion_mode=kwargs.get("fusion_mode", "log_add"),
         )
-    # GAT and MetaPathTxClassifier models require in_channels_dict
-    elif model_name == "gat" or model_name == "metapath":
+    # GAT, GAT Multi-task, and MetaPathTxClassifier models require in_channels_dict
+    elif model_name == "gat" or model_name == "gat_multitask" or model_name == "metapath":
         if in_channels_dict is None:
             if in_channels is None:
                 raise ValueError(f"{model_name.upper()} model requires either 'in_channels_dict' or 'in_channels'")
@@ -1583,6 +1761,16 @@ def get_model(model_name, in_channels=None, in_channels_dict=None, hidden_channe
                 "semantic_hidden_dim": kwargs.get("semantic_hidden_dim", 32),
             }
             return models[model_name](**metapath_kwargs)
+        elif model_name == "gat_multitask":
+            # GAT Multi-task model
+            return models[model_name](
+                in_channels_dict=in_channels_dict,
+                hidden_channels=hidden_channels,
+                out_channels=out_channels,
+                num_layers=kwargs.get("num_layers", 2),
+                heads=kwargs.get("heads", 4),
+                dropout=kwargs.get("dropout", 0.5),
+            )
         else:
             # GAT model
             return models[model_name](
@@ -1608,8 +1796,22 @@ def get_model(model_name, in_channels=None, in_channels_dict=None, hidden_channe
             lambda_1=kwargs.get("lambda_1", 1.0),
             inter=kwargs.get("inter", "GNN"),
         )
+    # HeteroSAGE model requires in_channels_dict
+    elif model_name == "sage":
+        if in_channels_dict is None:
+            if in_channels is None:
+                raise ValueError(f"{model_name.upper()} model requires either 'in_channels_dict' or 'in_channels'")
+            # Fallback: use same dimension for all node types
+            in_channels_dict = {"tx": in_channels, "addr": in_channels}
+        
+        return models[model_name](
+            in_channels_dict=in_channels_dict,
+            hidden_channels=hidden_channels,
+            out_channels=out_channels,
+            **kwargs
+        )
     else:
-        # SAGE, GCN, and GTNLite use in_channels
+        # GCN and GTNLite use in_channels
         if in_channels is None:
             raise ValueError(f"{model_name.upper()} model requires 'in_channels'")
         return models[model_name](

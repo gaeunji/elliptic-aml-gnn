@@ -11,6 +11,7 @@ import random
 import numpy as np
 from pathlib import Path
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score
+from sklearn.model_selection import train_test_split
 import numpy as np
 from torch_geometric.data import HeteroData, Data
 
@@ -51,13 +52,13 @@ def get_args():
     
     # Model
     parser.add_argument("--model", type=str, default="sage", 
-                       choices=["sage", "gat", "gcn", "metapath", "homogat", "care", "hgt"],
+                       choices=["sage", "gat", "gcn", "metapath", "homogat", "hgt", "gat_multitask"],
                        help="Model architecture")
     parser.add_argument("--hidden_channels", type=int, default=64,
                        help="Hidden layer dimension")
     parser.add_argument("--num_layers", type=int, default=2,
                        help="Number of GNN layers")
-    parser.add_argument("--dropout", type=float, default=0.5,
+    parser.add_argument("--dropout", type=float, default=0.3,
                        help="Dropout rate")
     parser.add_argument("--aggr", type=str, default="sum",
                        choices=["sum", "mean", "max"],
@@ -81,18 +82,6 @@ def get_args():
     parser.add_argument("--semantic_hidden_dim", type=int, default=32,
                        help="Hidden dimension for semantic attention (metapath model)")
     
-    # CARE-GNN specific
-    parser.add_argument("--lambda_1", type=float, default=1.0,
-                       help="Weight for label loss in CARE-GNN")
-    parser.add_argument("--temperature", type=float, default=1.0,
-                       help="Temperature parameter for label-aware similarity in CARE-GNN")
-    parser.add_argument("--care_batch_size", type=int, default=512,
-                       help="Batch size for CARE-GNN mini-batch training")
-    parser.add_argument("--care_use_batch", action="store_true", default=True,
-                       help="Use mini-batch training for CARE-GNN (default: True)")
-    parser.add_argument("--care_no_batch", dest="care_use_batch", action="store_false",
-                       help="Disable mini-batch training for CARE-GNN (use full graph)")
-    
     # HGT specific
     parser.add_argument("--conv_name", type=str, default="hgt",
                        choices=["hgt", "hgt_care", "dense_hgt"],
@@ -112,7 +101,7 @@ def get_args():
                        help="Fusion mode for HGT-CARE")
     
     # Training
-    parser.add_argument("--lr", type=float, default=0.01,
+    parser.add_argument("--lr", type=float, default=0.005,
                        help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=5e-4,
                        help="Weight decay")
@@ -124,7 +113,7 @@ def get_args():
     # Neighbor Sampling
     parser.add_argument("--batch_size", type=int, default=1024,
                        help="Batch size for neighbor sampling")
-    parser.add_argument("--num_neighbors", type=int, nargs="+", default=[10, 5],
+    parser.add_argument("--num_neighbors", type=int, nargs="+", default=[20, 10],
                        help="Number of neighbors to sample per layer (e.g., [10, 5] for 2 layers)")
     parser.add_argument("--use_neighbor_sampling", action="store_true",
                        help="Use neighbor sampling for training (default: full graph)")
@@ -134,7 +123,7 @@ def get_args():
                        help="Device to use (auto/cuda/cpu)")
     
     # Seed
-    parser.add_argument("--seed", type=int, default=88,
+    parser.add_argument("--seed", type=int, default=2,
                        help="Random seed for reproducibility")
     
     # Save
@@ -205,22 +194,112 @@ def load_data(data_path, use_neighbor_sampling=False):
         
         # Add node labels and masks (tx only)
         hetero_data["tx"].y = data["tx"].y  # {1, 2, -1}
-        hetero_data["tx"].train_mask = data["tx"].train_mask
-        hetero_data["tx"].val_mask = data["tx"].val_mask
-        hetero_data["tx"].test_mask = data["tx"].test_mask
         
-        # Add edges
-        hetero_data["tx", "to", "tx"].edge_index = data["tx", "to", "tx"].edge_index
-        hetero_data["addr", "to", "addr"].edge_index = data["addr", "to", "addr"].edge_index
-        hetero_data["addr", "to", "tx"].edge_index = data["addr", "to", "tx"].edge_index
-        hetero_data["tx", "to", "addr"].edge_index = data["tx", "to", "addr"].edge_index
-        
-        # Map labels: 1(illicit/불법) → 1, 2(licit/정상) → 0
+        # Map labels first (needed for mask creation)
         y_tx_raw = data["tx"].y.clone()
         y_tx = y_tx_raw.clone()
-        label_map = {1: 1, 2: 0}  # illicit → 1, licit → 0
+        
+        # Apply label mapping: 1→1, 2→0, 3→-1
+        label_map = {1: 1, 2: 0, 3: -1}
         for old, new in label_map.items():
             y_tx[y_tx_raw == old] = new
+        
+        # Create masks if they don't exist
+        if hasattr(data["tx"], "train_mask") and hasattr(data["tx"], "val_mask") and hasattr(data["tx"], "test_mask"):
+            hetero_data["tx"].train_mask = data["tx"].train_mask
+            hetero_data["tx"].val_mask = data["tx"].val_mask
+            hetero_data["tx"].test_mask = data["tx"].test_mask
+        else:
+            # Create masks from labeled nodes
+            # Support both formats:
+            # - build_graph.py: 0 and 1 are labeled
+            # - preprocess.py: 1 and 2 are labeled
+            unique_labels = torch.unique(y_tx_raw).tolist()
+            if 0 in unique_labels or (1 in unique_labels and -1 in unique_labels and 2 not in unique_labels):
+                # build_graph.py format: 0 and 1 are labeled
+                labeled_mask = (y_tx_raw == 0) | (y_tx_raw == 1)
+            else:
+                # preprocess.py format: 1 and 2 are labeled
+                labeled_mask = (y_tx_raw == 1) | (y_tx_raw == 2)
+            
+            labeled_indices = torch.where(labeled_mask)[0].cpu().numpy()
+            labeled_labels = y_tx[labeled_indices].cpu().numpy()  # Use mapped labels for stratification
+            
+            if len(labeled_indices) == 0:
+                raise ValueError("No labeled nodes found. Found label values: {}".format(torch.unique(y_tx_raw).tolist()))
+            
+            # Stratified split: train 60%, val 20%, test 20%
+            train_indices, temp_indices, train_labels_split, temp_labels = train_test_split(
+                labeled_indices,
+                labeled_labels,
+                test_size=0.4,
+                stratify=labeled_labels,
+                random_state=42
+            )
+            
+            val_indices, test_indices, val_labels_split, test_labels_split = train_test_split(
+                temp_indices,
+                temp_labels,
+                test_size=0.5,
+                stratify=temp_labels,
+                random_state=42
+            )
+            
+            train_mask = torch.zeros(data["tx"].x.size(0), dtype=torch.bool)
+            val_mask = torch.zeros(data["tx"].x.size(0), dtype=torch.bool)
+            test_mask = torch.zeros(data["tx"].x.size(0), dtype=torch.bool)
+            
+            train_mask[train_indices] = True
+            val_mask[val_indices] = True
+            test_mask[test_indices] = True
+            
+            hetero_data["tx"].train_mask = train_mask
+            hetero_data["tx"].val_mask = val_mask
+            hetero_data["tx"].test_mask = test_mask
+            
+            print(f"Created masks from labeled nodes:")
+            print(f"  Train: {train_mask.sum().item():,} nodes")
+            print(f"  Val:   {val_mask.sum().item():,} nodes")
+            print(f"  Test:  {test_mask.sum().item():,} nodes")
+        
+        # Add addr labels and masks if available (for multi-task models)
+        if "addr" in data.node_types:
+            if hasattr(data["addr"], "y"):
+                hetero_data["addr"].y = data["addr"].y
+            if hasattr(data["addr"], "train_mask"):
+                hetero_data["addr"].train_mask = data["addr"].train_mask
+            if hasattr(data["addr"], "val_mask"):
+                hetero_data["addr"].val_mask = data["addr"].val_mask
+            if hasattr(data["addr"], "test_mask"):
+                hetero_data["addr"].test_mask = data["addr"].test_mask
+        
+        # Add edges (only if they exist)
+        edge_types = [
+            ('addr', 'addr_to_tx', 'tx'),
+            ('tx', 'tx_to_tx', 'tx'),
+            ('tx', 'tx_to_addr', 'addr'),
+        ]
+        for edge_type in edge_types:
+            if hasattr(data[edge_type], "edge_index"):
+                hetero_data[edge_type].edge_index = data[edge_type].edge_index
+        
+        # Map labels
+        # Support two formats:
+        # - build_graph.py: 0(licit), 1(illicit), -1(unlabeled) → keep as is
+        # - preprocess.py: 1(illicit), 2(licit), 3(unlabeled) → map to 1→1, 2→0, 3→-1
+        y_tx_raw = data["tx"].y.clone()
+        y_tx = y_tx_raw.clone()
+        
+        # Check which format we have
+        unique_labels = torch.unique(y_tx_raw).tolist()
+        if 0 in unique_labels or (1 in unique_labels and -1 in unique_labels and 2 not in unique_labels):
+            # build_graph.py format: 0(licit), 1(illicit), -1(unlabeled) - already correct
+            pass  # No mapping needed
+        elif 2 in unique_labels or 3 in unique_labels:
+            # preprocess.py format: 1→1, 2→0, 3→-1
+            label_map = {1: 1, 2: 0, 3: -1}
+            for old, new in label_map.items():
+                y_tx[y_tx_raw == old] = new
         
         return hetero_data, y_tx, y_tx_raw
     else:
@@ -234,24 +313,88 @@ def load_data(data_path, use_neighbor_sampling=False):
         # Extract labels (tx only)
         y_tx_raw = data["tx"].y  # {1, 2, -1}
         
-        # Extract edges
-        edge_index_dict = {
-            ("tx", "to", "tx"):     data["tx", "to", "tx"].edge_index,
-            ("addr", "to", "addr"): data["addr", "to", "addr"].edge_index,
-            ("addr", "to", "tx"):   data["addr", "to", "tx"].edge_index,
-            ("tx", "to", "addr"):   data["tx", "to", "addr"].edge_index,
-        }
+        # Extract edges (only if they exist)
+        edge_index_dict = {}
+        edge_types = [
+            ('addr', 'addr_to_tx', 'tx'),
+            ('tx', 'tx_to_tx', 'tx'),
+            ('tx', 'tx_to_addr', 'addr'),
+            ('addr', 'addr_to_addr', 'addr'),
+        ]
+        for edge_type in edge_types:
+            if hasattr(data[edge_type], "edge_index"):
+                edge_index_dict[edge_type] = data[edge_type].edge_index
         
-        # Extract masks
-        train_mask = data["tx"].train_mask
-        val_mask = data["tx"].val_mask
-        test_mask = data["tx"].test_mask
-        
-        # Map labels: 1(illicit/불법) → 1, 2(licit/정상) → 0
+        # Map labels
+        # Support two formats:
+        # - build_graph.py: 0(licit), 1(illicit), -1(unlabeled) → keep as is
+        # - preprocess.py: 1(illicit), 2(licit), 3(unlabeled) → map to 1→1, 2→0, 3→-1
         y_tx = y_tx_raw.clone()
-        label_map = {1: 1, 2: 0}  # illicit → 1, licit → 0
-        for old, new in label_map.items():
-            y_tx[y_tx_raw == old] = new
+        
+        # Check which format we have
+        unique_labels = torch.unique(y_tx_raw).tolist()
+        if 0 in unique_labels or (1 in unique_labels and -1 in unique_labels and 2 not in unique_labels):
+            # build_graph.py format: 0(licit), 1(illicit), -1(unlabeled) - already correct
+            pass  # No mapping needed
+        elif 2 in unique_labels or 3 in unique_labels:
+            # preprocess.py format: 1→1, 2→0, 3→-1
+            label_map = {1: 1, 2: 0, 3: -1}
+            for old, new in label_map.items():
+                y_tx[y_tx_raw == old] = new
+        
+        # Extract masks (if they exist, otherwise create from labeled nodes)
+        if hasattr(data["tx"], "train_mask") and hasattr(data["tx"], "val_mask") and hasattr(data["tx"], "test_mask"):
+            train_mask = data["tx"].train_mask
+            val_mask = data["tx"].val_mask
+            test_mask = data["tx"].test_mask
+        else:
+            # Create masks from labeled nodes
+            # Support both formats:
+            # - build_graph.py: 0 and 1 are labeled
+            # - preprocess.py: 1 and 2 are labeled
+            unique_labels = torch.unique(y_tx_raw).tolist()
+            if 0 in unique_labels or (1 in unique_labels and -1 in unique_labels and 2 not in unique_labels):
+                # build_graph.py format: 0 and 1 are labeled
+                labeled_mask = (y_tx_raw == 0) | (y_tx_raw == 1)
+            else:
+                # preprocess.py format: 1 and 2 are labeled
+                labeled_mask = (y_tx_raw == 1) | (y_tx_raw == 2)
+            
+            labeled_indices = torch.where(labeled_mask)[0].cpu().numpy()
+            labeled_labels = y_tx[labeled_indices].cpu().numpy()  # Use mapped labels for stratification
+            
+            if len(labeled_indices) == 0:
+                raise ValueError("No labeled nodes found. Found label values: {}".format(torch.unique(y_tx_raw).tolist()))
+            
+            # Stratified split: train 60%, val 20%, test 20%
+            train_indices, temp_indices, train_labels_split, temp_labels = train_test_split(
+                labeled_indices,
+                labeled_labels,
+                test_size=0.4,
+                stratify=labeled_labels,
+                random_state=42
+            )
+            
+            val_indices, test_indices, val_labels_split, test_labels_split = train_test_split(
+                temp_indices,
+                temp_labels,
+                test_size=0.5,
+                stratify=temp_labels,
+                random_state=42
+            )
+            
+            train_mask = torch.zeros(data["tx"].x.size(0), dtype=torch.bool)
+            val_mask = torch.zeros(data["tx"].x.size(0), dtype=torch.bool)
+            test_mask = torch.zeros(data["tx"].x.size(0), dtype=torch.bool)
+            
+            train_mask[train_indices] = True
+            val_mask[val_indices] = True
+            test_mask[test_indices] = True
+            
+            print(f"Created masks from labeled nodes:")
+            print(f"  Train: {train_mask.sum().item():,} nodes")
+            print(f"  Val:   {val_mask.sum().item():,} nodes")
+            print(f"  Test:  {test_mask.sum().item():,} nodes")
         
         return x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask, val_mask, test_mask
 
@@ -314,33 +457,6 @@ def train_epoch_full_graph(model, x_dict_or_x, edge_index_dict_or_edge_index, y_
             loss = F.cross_entropy(logits_tx[mask], y_tx[mask], weight=class_weights)
         else:
             loss = F.cross_entropy(logits_tx[mask], y_tx[mask])
-    # CARE-GNN uses its own loss method
-    elif model_name == "care":
-        # Note: CARE-GNN mini-batch training is handled separately in train_epoch_batch
-        # This path is for full graph training (when care_use_batch=False)
-        import time
-        forward_start = time.time()
-        x = x_dict_or_x
-        adj_lists = edge_index_dict_or_edge_index  # adj_lists (pre-converted)
-        labels = y_tx_raw
-        
-        # Verify adj_lists is a list
-        if not isinstance(adj_lists, list):
-            raise TypeError(
-                f"For CARE-GNN, edge_index_dict_or_edge_index must be a list (adj_lists), "
-                f"got {type(adj_lists)}. Expected format: [adj_list_dict1, adj_list_dict2, ...]"
-            )
-        
-        # Forward pass can be slow - add progress indication
-        loss = model.loss(x, adj_lists=adj_lists, labels=labels, train_flag=True, batch_nodes=None)
-        if time.time() - forward_start > 5.0:
-            print(f"      [CARE-GNN] Loss computation took {time.time() - forward_start:.2f}s")
-        
-        # Get logits (second forward pass - can be optimized)
-        logits_start = time.time()
-        logits_tx, _ = model(x, adj_lists=adj_lists, labels=labels, train_flag=True, batch_nodes=None)
-        if time.time() - logits_start > 5.0:
-            print(f"      [CARE-GNN] Logits computation took {time.time() - logits_start:.2f}s")
     # MetaPathTxClassifier returns (logits, alpha, h_tx_fused) tuple
     elif model_name == "metapath":
         logits_tx, alpha, h_tx_fused = model(x_dict_or_x, edge_index_dict_or_edge_index)
@@ -419,17 +535,6 @@ def train_epoch_neighbor_sampling(model, train_loader, device, optimizer, class_
                 
                 total_loss += float(loss.item())
                 num_batches += 1
-        elif model_name == "care":
-            # CARE-GNN uses its own loss method
-            # Get labels for CARE-GNN (needs raw labels with -1 for unlabeled)
-            y_batch_raw = batch["tx"].y
-            labels_dict = {"tx": y_batch_raw}
-            loss = model.loss(x_dict, edge_index_dict, labels_dict, train_flag=True)
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += float(loss.item())
-            num_batches += 1
         else:
             out_dict = model(x_dict, edge_index_dict)
             logits_tx = out_dict["tx"]
@@ -476,20 +581,6 @@ def evaluate(model, x_dict_or_x, edge_index_dict_or_edge_index, y_tx, y_tx_raw, 
     # MetaPathTxClassifier returns (logits, alpha, h_tx_fused) tuple
     elif model_name == "metapath":
         logits_tx, alpha, h_tx_fused = model(x_dict_or_x, edge_index_dict_or_edge_index)
-    # CARE-GNN returns (scores, label_scores) tuple
-    elif model_name == "care":
-        x = x_dict_or_x
-        adj_lists = edge_index_dict_or_edge_index  # adj_lists (pre-converted)
-        
-        # Verify adj_lists is a list
-        if not isinstance(adj_lists, list):
-            raise TypeError(
-                f"For CARE-GNN, edge_index_dict_or_edge_index must be a list (adj_lists), "
-                f"got {type(adj_lists)}. Expected format: [adj_list_dict1, adj_list_dict2, ...]"
-            )
-        
-        logits_tx, label_scores = model(x, adj_lists=adj_lists, train_flag=False, batch_nodes=None)
-        logits_tx = logits_tx.cpu()
     else:
         # Heterogeneous graph
         out_dict = model(x_dict_or_x, edge_index_dict_or_edge_index)
@@ -611,9 +702,6 @@ def evaluate_from_hetero_data(model, hetero_data, y_tx, y_tx_raw, mask_name, dev
     if model_name == "metapath":
         logits_tx, alpha, h_tx_fused = model(x_dict, edge_index_dict)
         logits_tx = logits_tx.cpu()
-    # CARE-GNN should not use heterogeneous data
-    elif model_name == "care":
-        raise ValueError("CARE-GNN requires homogeneous graph data. Use evaluate() instead of evaluate_from_hetero_data()")
     else:
         out_dict = model(x_dict, edge_index_dict)
         logits_tx = out_dict["tx"].cpu()
@@ -757,28 +845,6 @@ def main():
     print("Loading data...")
     print("=" * 60)
     
-    # CARE-GNN requires elliptic_tx_only.pt (homogeneous graph)
-    if args.model == "care":
-        if "tx_only" not in args.data_path:
-            print("=" * 60)
-            print("⚠️  Warning: CARE-GNN requires 'elliptic_tx_only.pt' data")
-            print(f"   Current data path: {args.data_path}")
-            print("   Forcing use of homogeneous graph data...")
-            print("=" * 60)
-            # Try to find elliptic_tx_only.pt in the same directory
-            data_dir = Path(args.data_path).parent
-            tx_only_path = data_dir / "elliptic_tx_only.pt"
-            if tx_only_path.exists():
-                args.data_path = str(tx_only_path)
-                print(f"   Using: {args.data_path}")
-            else:
-                raise ValueError(
-                    f"CARE-GNN requires 'elliptic_tx_only.pt' data.\n"
-                    f"Please generate it using: python preprocess_tx_only.py\n"
-                    f"Or specify the correct path with --data_path"
-                )
-        args.use_neighbor_sampling = False  # CARE-GNN doesn't support neighbor sampling
-    
     # Check if homogeneous model (HomoGAT doesn't support neighbor sampling)
     if args.model == "homogat" and args.use_neighbor_sampling:
         print("⚠️  Warning: HomoGAT doesn't support neighbor sampling. Using full graph training.")
@@ -879,17 +945,9 @@ def main():
             addr_feat_dim = None  # Not used for homogeneous
             is_homogeneous_data = True
             
-            # For CARE-GNN: prepare data with meta-relations
-            if args.model == "care":
-                from care_gnn_model import prepare_care_gnn_data
-                x, meta_relations, y_tx, y_tx_raw, train_mask, val_mask, test_mask = prepare_care_gnn_data(
-                    args.data_path, device=device
-                )
-                edge_index_dict_eval = meta_relations  # meta_relations dict
-                x_dict_eval = x  # Tensor for CARE-GNN
-            else:
-                edge_index_dict_eval = edge_index  # Tensor for other models
-                x_dict_eval = x  # Tensor for other models
+            # For compatibility
+            edge_index_dict_eval = edge_index  # Tensor for other models
+            x_dict_eval = x  # Tensor for other models
             
             # For compatibility
             train_loader = None
@@ -934,7 +992,7 @@ def main():
     print("=" * 60)
     
     # Check if homogeneous model
-    is_homogeneous_model = args.model in ["homogat", "care"]
+    is_homogeneous_model = args.model == "homogat"
     
     # Check data-model compatibility (after data loading)
     # is_homogeneous_data should be set in the data loading section above
@@ -955,7 +1013,7 @@ def main():
             f"Model '{args.model}' requires heterogeneous graph data (with Address nodes),\n"
             f"but provided data is homogeneous (Tx-only).\n"
             f"Please use 'elliptic_hetero_static.pt' instead of 'elliptic_tx_only.pt',\n"
-            f"or use 'homogat' or 'care' model for homogeneous graph data."
+            f"or use 'homogat' model for homogeneous graph data."
         )
     
     # Homogeneous model requires homogeneous data
@@ -999,6 +1057,28 @@ def main():
             out_channels=2,  # Binary classification
             **model_kwargs
         ).to(device)
+    elif args.model == "gat_multitask":
+        # GAT Multi-task model requires in_channels_dict and doesn't use aggr
+        if addr_feat_dim is None:
+            raise ValueError(
+                "GAT Multi-task model requires heterogeneous graph data with Address nodes.\n"
+                "Please use 'elliptic_hetero_static.pt' instead of 'elliptic_tx_only.pt'."
+            )
+        model_kwargs = {
+            "num_layers": args.num_layers,
+            "dropout": args.dropout,
+            "heads": args.heads,
+        }
+        model = get_model(
+            model_name=args.model,
+            in_channels_dict={
+                "tx": tx_feat_dim,
+                "addr": addr_feat_dim
+            },
+            hidden_channels=args.hidden_channels,
+            out_channels=2,  # Binary classification
+            **model_kwargs
+        ).to(device)
     elif args.model == "metapath":
         # MetaPathTxClassifier model requires in_channels_dict
         model_kwargs = {
@@ -1019,27 +1099,6 @@ def main():
             out_channels=2,  # Binary classification
             **model_kwargs
         ).to(device)
-    elif args.model == "care":
-        if not is_homogeneous_data:
-            raise ValueError(
-                "CARE-GNN requires homogeneous graph data (elliptic_tx_only.pt).\n"
-                "Please use 'elliptic_tx_only.pt' instead of heterogeneous data."
-            )
-        
-        model_kwargs = {
-            "embed_dim": args.hidden_channels,
-            "lambda_1": args.lambda_1,
-            "inter": "GNN",
-        }
-        model_kwargs["relation_names"] = None  # Determined from meta_relations
-        
-        model = get_model(
-            model_name=args.model,
-            in_channels=tx_feat_dim,
-            hidden_channels=args.hidden_channels,
-            out_channels=2,
-            **model_kwargs
-        ).to(device)
     elif args.model == "hgt":
         # HGT model requires in_channels_dict and heterogeneous graph data
         if addr_feat_dim is None:
@@ -1050,7 +1109,7 @@ def main():
         
         model_kwargs = {
             "num_types": 2,  # tx and addr
-            "num_relations": 4,  # tx->tx, addr->addr, tx->addr, addr->tx
+            "num_relations": 3,  # addr_to_tx, tx_to_tx, tx_to_addr
             "n_heads": args.heads,
             "num_layers": args.num_layers,
             "dropout": args.dropout,
@@ -1091,7 +1150,10 @@ def main():
         
         model = get_model(
             model_name=args.model,
-            in_channels=tx_feat_dim,  # Note: HeteroSAGE uses same in_channels for both tx and addr
+            in_channels_dict={
+                "tx": tx_feat_dim,
+                "addr": addr_feat_dim
+            },
             hidden_channels=args.hidden_channels,
             out_channels=2,  # Binary classification
             **model_kwargs
@@ -1151,7 +1213,7 @@ def main():
     print("Training...")
     print("=" * 60)
     
-    best_val_acc = 0.0
+    best_val_auc = 0.0
     best_test_acc = 0.0
     best_epoch = 0
     
@@ -1171,61 +1233,11 @@ def main():
         else:
             # Use appropriate data format based on model type
             if is_homogeneous_model:
-                # Homogeneous graph: use x and edge_index (or meta_relations for CARE-GNN)
-                if args.model == "care":
-                    # CARE-GNN: 미니배치 또는 full graph 학습
-                    from care_gnn_model import train_epoch_batch, evaluate_batch
-                    
-                    if args.care_use_batch:
-                        # 미니배치 학습
-                        print(f"  Training (CARE-GNN mini-batch, batch_size={args.care_batch_size})...", end=" ", flush=True)
-                        train_loss = train_epoch_batch(
-                            model=model,
-                            x=x_dict_eval,
-                            adj_lists=edge_index_dict_eval,
-                            y_tx=y_tx,  # 매핑된 label 사용 (0, 1, -1)
-                            train_mask=train_mask_eval,
-                            optimizer=optimizer,
-                            batch_size=args.care_batch_size,
-                            device=device
-                        )
-                        print(f"Loss: {train_loss:.4f}")
-                        
-                        # 평가는 전체 그래프 사용
-                        train_acc, train_loss_eval, _, _ = evaluate_batch(
-                            model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, train_mask_eval, device
-                        )
-                        val_acc, val_loss, _, _ = evaluate_batch(
-                            model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, val_mask_eval, device
-                        )
-                        test_acc, _, _, _ = evaluate_batch(
-                            model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, test_mask_eval, device
-                        )
-                        
-                        # evaluate_batch는 accuracy와 loss만 반환하므로, 다른 메트릭은 evaluate 사용
-                        _, train_prec, train_rec, train_f1, train_auc, _, train_cm, train_prec_at_k, train_rec_at_k = evaluate(
-                            model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, train_mask_eval, model_name=args.model
-                        )
-                        _, val_prec, val_rec, val_f1, val_auc, _, val_cm, val_prec_at_k, val_rec_at_k = evaluate(
-                            model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, val_mask_eval, model_name=args.model
-                        )
-                        _, test_prec, test_rec, test_f1, test_auc, _, test_cm, test_prec_at_k, test_rec_at_k = evaluate(
-                            model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, test_mask_eval, model_name=args.model
-                        )
-                    else:
-                        # Full graph 학습 (기존 방식)
-                        print("  Training (CARE-GNN full graph - this may take a while for large graphs)...", end=" ", flush=True)
-                        train_loss = train_epoch_full_graph(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, train_mask_eval, optimizer, class_weights, model_name=args.model)
-                        print(f"Loss: {train_loss:.4f}")
-                        train_acc, train_prec, train_rec, train_f1, train_auc, _, train_cm, train_prec_at_k, train_rec_at_k = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, train_mask_eval, model_name=args.model)
-                        val_acc, val_prec, val_rec, val_f1, val_auc, val_loss, val_cm, val_prec_at_k, val_rec_at_k = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, val_mask_eval, model_name=args.model)
-                        test_acc, test_prec, test_rec, test_f1, test_auc, _, test_cm, test_prec_at_k, test_rec_at_k = evaluate(model, x_dict_eval, edge_index_dict_eval, y_tx, y_tx_raw, test_mask_eval, model_name=args.model)
-                else:
-                    # Other homogeneous models (e.g., HomoGAT): use x and edge_index
-                    train_loss = train_epoch_full_graph(model, x, edge_index, y_tx, y_tx_raw, train_mask, optimizer, class_weights, model_name=args.model)
-                    train_acc, train_prec, train_rec, train_f1, train_auc, _, train_cm, train_prec_at_k, train_rec_at_k = evaluate(model, x, edge_index, y_tx, y_tx_raw, train_mask, model_name=args.model)
-                    val_acc, val_prec, val_rec, val_f1, val_auc, val_loss, val_cm, val_prec_at_k, val_rec_at_k = evaluate(model, x, edge_index, y_tx, y_tx_raw, val_mask, model_name=args.model)
-                    test_acc, test_prec, test_rec, test_f1, test_auc, _, test_cm, test_prec_at_k, test_rec_at_k = evaluate(model, x, edge_index, y_tx, y_tx_raw, test_mask, model_name=args.model)
+                # Homogeneous graph: use x and edge_index
+                train_loss = train_epoch_full_graph(model, x, edge_index, y_tx, y_tx_raw, train_mask, optimizer, class_weights, model_name=args.model)
+                train_acc, train_prec, train_rec, train_f1, train_auc, _, train_cm, train_prec_at_k, train_rec_at_k = evaluate(model, x, edge_index, y_tx, y_tx_raw, train_mask, model_name=args.model)
+                val_acc, val_prec, val_rec, val_f1, val_auc, val_loss, val_cm, val_prec_at_k, val_rec_at_k = evaluate(model, x, edge_index, y_tx, y_tx_raw, val_mask, model_name=args.model)
+                test_acc, test_prec, test_rec, test_f1, test_auc, _, test_cm, test_prec_at_k, test_rec_at_k = evaluate(model, x, edge_index, y_tx, y_tx_raw, test_mask, model_name=args.model)
             else:
                 # Heterogeneous graph: use x_dict and edge_index_dict
                 train_loss = train_epoch_full_graph(model, x_dict, edge_index_dict, y_tx, y_tx_raw, train_mask, optimizer, class_weights, model_name=args.model)
@@ -1233,9 +1245,9 @@ def main():
                 val_acc, val_prec, val_rec, val_f1, val_auc, val_loss, val_cm, val_prec_at_k, val_rec_at_k = evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, val_mask, model_name=args.model)
                 test_acc, test_prec, test_rec, test_f1, test_auc, _, test_cm, test_prec_at_k, test_rec_at_k = evaluate(model, x_dict, edge_index_dict, y_tx, y_tx_raw, test_mask, model_name=args.model)
         
-        # Update best
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # Update best based on validation AUC
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
             best_test_acc = test_acc
             best_epoch = epoch
             best_val_metrics = (val_acc, val_prec, val_rec, val_f1, val_auc, val_cm, val_prec_at_k, val_rec_at_k)
@@ -1243,7 +1255,8 @@ def main():
             
             # Save model
             if args.save_model:
-                torch.save({
+                # Save feature dimensions for model reconstruction
+                save_dict = {
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
@@ -1258,7 +1271,17 @@ def main():
                     'test_f1': test_f1,
                     'test_auc': test_auc,
                     'args': vars(args),
-                }, args.model_save_path)
+                }
+                # Add feature dimensions if available
+                if not is_homogeneous_data:
+                    if args.use_neighbor_sampling:
+                        save_dict['tx_feat_dim'] = hetero_data["tx"].x.size(1)
+                        save_dict['addr_feat_dim'] = hetero_data["addr"].x.size(1)
+                    else:
+                        save_dict['tx_feat_dim'] = x_dict["tx"].size(1)
+                        save_dict['addr_feat_dim'] = x_dict["addr"].size(1)
+                
+                torch.save(save_dict, args.model_save_path)
         
         # Log - 모든 epoch에 대해 출력
         print(
@@ -1333,6 +1356,8 @@ def main():
     
     if args.save_model:
         print(f"\nModel saved to: {args.model_save_path}")
+        print(f"\nTo compute transaction scores, run:")
+        print(f"  python compute_scores.py --model_path {args.model_save_path} --data_path {args.data_path}")
 
 
 if __name__ == "__main__":
